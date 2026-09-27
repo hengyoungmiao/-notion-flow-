@@ -20,6 +20,11 @@ export interface NotionClient {
   getPage(id: string): Promise<NotionPage | null>
   createPage(body: Record<string, unknown>): Promise<NotionPage>
   updatePage(id: string, body: Record<string, unknown>): Promise<NotionPage>
+  /** 追加子块（最多 100 个）；position 为 page_start 时插到页面最前面 */
+  appendBlocks(parentId: string, children: unknown[], position?: { type: 'page_start' } | { type: 'after_block'; after_block: { id: string } }): Promise<{ results: Array<{ id: string; type?: string }> }>
+  /** 删除块（进入回收站）；块不存在时视为成功 */
+  deleteBlock(id: string): Promise<void>
+  listBlocks(id: string): Promise<Array<{ id: string; type: string; has_children?: boolean; [key: string]: unknown }>>
 }
 
 export interface NtnCommand {
@@ -148,5 +153,40 @@ export class NtnNotionClient implements NotionClient {
 
   updatePage(id: string, body: Record<string, unknown>): Promise<NotionPage> {
     return this.api('PATCH', `v1/pages/${id}`, body)
+  }
+
+  async appendBlocks(
+    parentId: string,
+    children: unknown[],
+    position?: { type: 'page_start' } | { type: 'after_block'; after_block: { id: string } }
+  ): Promise<{ results: Array<{ id: string; type?: string }> }> {
+    const res = await this.api<{ results?: Array<{ id: string; type?: string }> }>('PATCH', `v1/blocks/${parentId}/children`, {
+      children,
+      ...(position ? { position } : {})
+    })
+    return { results: res?.results ?? [] }
+  }
+
+  async deleteBlock(id: string): Promise<void> {
+    try {
+      await this.api('DELETE', `v1/blocks/${id}`)
+    } catch (e) {
+      if (e instanceof CliError && (e.kind === 'not_found' || /archived|in_trash/i.test(e.message))) return
+      throw e
+    }
+  }
+
+  async listBlocks(id: string): Promise<Array<{ id: string; type: string; has_children?: boolean }>> {
+    const out: Array<{ id: string; type: string; has_children?: boolean }> = []
+    let cursor: string | undefined
+    do {
+      const res = await this.api<NotionQueryResult<{ id: string; type: string; has_children?: boolean }>>(
+        'GET',
+        `v1/blocks/${id}/children${cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : ''}`
+      )
+      out.push(...(res?.results ?? []))
+      cursor = res?.has_more && res.next_cursor ? res.next_cursor : undefined
+    } while (cursor)
+    return out
   }
 }

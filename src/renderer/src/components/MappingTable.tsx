@@ -146,6 +146,29 @@ export function MappingTable({ workspaceId, compact }: { workspaceId: string; co
           }
         ]}
       />
+      {data?.tagProjects && (
+        <Table
+          size="small"
+          rowKey="tag"
+          pagination={false}
+          scroll={compact ? { y: 240 } : undefined}
+          dataSource={data.tagProjects}
+          title={() => (
+            <Typography.Text type="secondary">
+              标签 → 项目：滴答任务打上与 FLO.W 项目同名的标签，就会关联到该项目（忽略大小写、空格和标点）。
+            </Typography.Text>
+          )}
+          locale={{ emptyText: '滴答里还没有标签' }}
+          columns={[
+            { title: '滴答标签', dataIndex: 'tag', render: (t: string) => <Tag>#{t}</Tag> },
+            {
+              title: '关联的 FLO.W 项目',
+              dataIndex: 'projectTitle',
+              render: (p: string | null) => (p ? <Tag color="green">{p}</Tag> : <Typography.Text type="secondary">未匹配（不影响项目）</Typography.Text>)
+            }
+          ]}
+        />
+      )}
     </Space>
   )
 }

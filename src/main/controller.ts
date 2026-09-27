@@ -14,7 +14,7 @@ import {
   ensureDidaIdProperty,
   findTaskCandidates,
   resolveTaskDataSource,
-  upgradeFocusSchema,
+  upgradeSchema,
   validateSchema
 } from '../core/notion/discovery'
 import { Scheduler, type SchedulerSnapshot } from '../core/scheduler'
@@ -123,9 +123,10 @@ export class AppController implements FlowSyncApi {
   /** 旧版本识别的工作空间补充识别番茄库（失败不影响任务同步） */
   private async upgradeSchemas(): Promise<void> {
     for (const ws of this.config.get().workspaces) {
-      if (!ws.schema || ws.schema.focus !== undefined) continue
+      if (!ws.schema) continue
       try {
-        const schema = await upgradeFocusSchema(this.clientFor(ws), ws.schema)
+        const schema = await upgradeSchema(this.clientFor(ws), ws.schema)
+        if (schema === ws.schema) continue
         await this.config.upsertWorkspace({ ...this.workspace(ws.id), schema })
       } catch {
         /* 下次启动再试 */

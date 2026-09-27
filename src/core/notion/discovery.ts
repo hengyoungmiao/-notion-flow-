@@ -6,6 +6,7 @@ import {
   bindAreaSchema,
   bindDomainSchema,
   bindFocusSchema,
+  bindProjectSchema,
   bindTaskSchema,
   dataSourceTitle,
   looksLikeFlowTasks,
@@ -102,11 +103,13 @@ export async function bindFlowSchema(client: NotionClient, taskDataSourceId: str
   }
 
   const focus = await loadFocusSchema(client, task.focusDataSourceId, taskDs.id, issues)
+  const projects = await loadProjectSchema(client, task.projectsDataSourceId, issues)
   const schema: FlowSchema = {
     tasks: { ...task.tasks, props: { ...task.tasks.props, didaId: task.tasks.props.didaId ?? '' } },
     domains,
     areas,
-    focus
+    focus,
+    projects
   }
   return { schema, issues, needsDidaIdProperty: !task.tasks.props.didaId }
 }
@@ -132,14 +135,36 @@ async function loadFocusSchema(
   }
 }
 
-/** 旧版本识别的配置没有番茄库：补充识别（不改动其它绑定） */
-export async function upgradeFocusSchema(client: NotionClient, schema: FlowSchema): Promise<FlowSchema> {
-  if (schema.focus !== undefined) return schema
+async function loadProjectSchema(
+  client: NotionClient,
+  projectsDataSourceId: string | null,
+  issues: BindIssue[]
+): Promise<FlowSchema['projects']> {
+  if (!projectsDataSourceId) {
+    issues.push({ level: 'warning', message: '未找到「关联项目」字段，将不按标签关联项目' })
+    return null
+  }
+  try {
+    return bindProjectSchema(await client.getDataSource(projectsDataSourceId))
+  } catch (e) {
+    if (e instanceof CliError && e.kind === 'auth') throw e
+    issues.push({ level: 'warning', message: '无法读取项目库，将不按标签关联项目' })
+    return null
+  }
+}
+
+/** 旧版本识别的配置没有番茄库 / 项目库：补充识别（不改动其它绑定） */
+export async function upgradeSchema(client: NotionClient, schema: FlowSchema): Promise<FlowSchema> {
+  if (schema.focus !== undefined && schema.projects !== undefined && schema.tasks.props.project !== undefined) return schema
   const taskDs = await client.getDataSource(schema.tasks.dataSourceId)
   const task = bindTaskSchema(taskDs)
-  const focus = await loadFocusSchema(client, task.focusDataSourceId, taskDs.id, [])
-  return { ...schema, focus }
+  const focus = schema.focus !== undefined ? schema.focus : await loadFocusSchema(client, task.focusDataSourceId, taskDs.id, [])
+  const projects = schema.projects !== undefined ? schema.projects : await loadProjectSchema(client, task.projectsDataSourceId, [])
+  return { ...schema, tasks: { ...schema.tasks, props: { ...schema.tasks.props, project: task.tasks.props.project } }, focus, projects }
 }
+
+/** @deprecated 使用 upgradeSchema */
+export const upgradeFocusSchema = upgradeSchema
 
 /** 在任务库中新增「滴答ID」文本字段（只新增，不改动模板原有字段） */
 export async function ensureDidaIdProperty(client: NotionClient, schema: FlowSchema): Promise<FlowSchema> {

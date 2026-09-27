@@ -20,6 +20,13 @@ export interface DidaChecklistItem {
   id?: string
   title?: string
   status?: number
+  sortOrder?: number
+}
+
+export interface DidaTag {
+  name: string
+  label?: string
+  parent?: string | null
 }
 
 export interface DidaTask {
@@ -39,7 +46,10 @@ export interface DidaTask {
   kind?: string | null // TEXT | NOTE | CHECKLIST
   parentId?: string | null
   repeatFlag?: string | null
+  repeatFrom?: number | string | null
   repeatTaskId?: string | null
+  childIds?: string[] | null
+  sortOrder?: number
   items?: DidaChecklistItem[]
   tags?: string[]
   priority?: number
@@ -160,6 +170,8 @@ export interface FlowSchema {
       domain: string | null
       didaId: string
       taskType: string | null
+      /** 「关联项目」关系；旧配置可能没有 */
+      project?: string | null
     }
     statusOptions: { open: string; done: string; abandoned: string }
     statusGroups: Record<string, StatusGroup>
@@ -171,6 +183,12 @@ export interface FlowSchema {
     props: { title: string; area: string | null }
   } | null
   areas: {
+    dataSourceId: string
+    title: string
+    props: { title: string }
+  } | null
+  /** FLO.W「我的项目 DB」（通过任务库的「关联项目」找到）；undefined 表示旧配置尚未识别 */
+  projects?: {
     dataSourceId: string
     title: string
     props: { title: string }
@@ -219,7 +237,10 @@ export interface AppSettings {
   structureMinutes: number
   deletePolicy: DeletePolicy
   breaker: { maxTrash: number; maxUpdateRatio: number; minUpdates: number }
-  syncNote: boolean
+  /** 描述、检查事项、子任务、重复规则写入页面顶部的“滴答同步区” */
+  syncBody: boolean
+  /** 滴答标签 #项目名 自动关联 FLO.W 同名项目 */
+  syncProjects: boolean
   applyTemplate: boolean
   recurringCompletionRecords: boolean
   /** 同步滴答的番茄钟/正计时记录到 FLO.W 任务番茄数据库 */
@@ -252,6 +273,8 @@ export interface WrittenTask {
   completedAt: NormalizedDate | null
   note: string | null
   domainPageId: string | null
+  /** 同步写入过的项目（手动关联的项目不在这里） */
+  projectPageIds?: string[]
 }
 
 export interface TaskLink {
@@ -263,6 +286,11 @@ export interface TaskLink {
   createdBySync: boolean
   linkedAt: string
   lastSeenAt: string
+  parentDidaId?: string | null
+  /** 页面顶部同步区（callout）的块 ID 与内容哈希 */
+  body?: { blockId: string | null; hash: string | null }
+  /** 重复任务的完成记录：本地日期（最近 20 次）、总次数、已计入的完成副本 ID（去重用） */
+  history?: { dates: string[]; count: number; ids: string[] }
 }
 
 export interface DomainLink {
@@ -335,5 +363,8 @@ export interface DesiredTask {
   note: string | null
   /** 期望的二级领域页；`pending:<projectId>` 表示本轮将新建 */
   domainPageId: string | null
+  /** 期望由同步关联的项目；null 表示不管理 */
+  projectPageIds: string[] | null
+  parentDidaId: string | null
   taskTypeOnCreate: 'schedule' | 'todo'
 }

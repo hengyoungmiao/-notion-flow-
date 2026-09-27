@@ -52,6 +52,10 @@ export function sanitizeTask(t: DidaTask): Record<string, unknown> {
     kind: t.kind ?? null,
     hasParent: !!t.parentId,
     repeatFlag: t.repeatFlag ?? null,
+    repeatFrom: t.repeatFrom ?? null,
+    tagCount: t.tags?.length ?? 0,
+    childCount: t.childIds?.length ?? 0,
+    itemKeys: t.items?.[0] ? Object.keys(t.items[0]).sort() : null,
     repeatTaskId: t.repeatTaskId ? hash(t.repeatTaskId) : null,
     itemCount: t.items?.length ?? 0,
     etag: t.etag ? 'present' : null

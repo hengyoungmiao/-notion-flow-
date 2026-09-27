@@ -15,11 +15,13 @@ import { normalizeNote, plainText, toRichText } from './text'
 
 export interface MapContext {
   schema: FlowSchema
-  settings: Pick<AppSettings, 'defaultTimeZone' | 'allDayEndExclusive' | 'syncNote'>
+  settings: Pick<AppSettings, 'defaultTimeZone' | 'allDayEndExclusive'>
   /** 滴答偏好设置里的时区（优先于默认时区） */
   userTimeZone?: string | null
   /** 清单 → 二级领域页（或 `pending:<projectId>`），收件箱/未映射返回 null */
   domainFor(projectId: string): string | null
+  /** 任务 → 由标签匹配到的项目页；返回 null 表示不管理「关联项目」 */
+  projectsFor?(task: DidaTask): string[] | null
 }
 
 export function statusGroupOf(task: DidaTask): StatusGroup {
@@ -36,7 +38,7 @@ export function desiredFromDida(task: DidaTask, ctx: MapContext): DesiredTask {
   const statusGroup = statusGroupOf(task)
   const scheduleValue = didaScheduleToNotion(task, opts)
   const completedValue = statusGroup === 'open' ? null : didaCompletedToNotion(task, opts)
-  const rawNote = task.kind === 'CHECKLIST' ? task.desc || task.content : task.content || task.desc
+  const projects = ctx.schema.tasks.props.project && ctx.projectsFor ? ctx.projectsFor(task) : null
   return {
     didaId: task.id,
     projectId: task.projectId,
@@ -46,10 +48,19 @@ export function desiredFromDida(task: DidaTask, ctx: MapContext): DesiredTask {
     scheduleValue,
     completedAt: normalizeDate(completedValue),
     completedValue,
-    note: ctx.settings.syncNote && ctx.schema.tasks.props.note ? normalizeNote(rawNote) : null,
+    // 描述改写到页面正文同步区，「下一步做什么？」留给用户和 Claude
+    note: null,
     domainPageId: ctx.schema.tasks.props.domain ? ctx.domainFor(task.projectId) : null,
+    projectPageIds: projects ? [...new Set(projects)].sort() : null,
+    parentDidaId: task.parentId || null,
     taskTypeOnCreate: hasTimeOfDay(scheduleValue) ? 'schedule' : 'todo'
   }
+}
+
+/** 任务描述：清单型任务用 desc，普通任务用 content */
+export function taskDescription(task: DidaTask): string {
+  const raw = task.kind === 'CHECKLIST' ? task.desc || task.content : task.content || task.desc
+  return normalizeNote(raw)
 }
 
 export function writtenFrom(desired: DesiredTask): WrittenTask {
@@ -59,7 +70,8 @@ export function writtenFrom(desired: DesiredTask): WrittenTask {
     schedule: desired.schedule,
     completedAt: desired.completedAt,
     note: desired.note,
-    domainPageId: desired.domainPageId
+    domainPageId: desired.domainPageId,
+    projectPageIds: desired.projectPageIds ?? []
   }
 }
 
@@ -76,6 +88,7 @@ export interface ActualTask {
   completedAt: NormalizedDate | null
   note: string | null
   domainIds: string[]
+  projectIds: string[]
   didaId: string | null
   inTrash: boolean
   createdTime?: string
@@ -120,6 +133,7 @@ export function readActual(page: NotionPage, schema: FlowSchema): ActualTask {
     completedAt: normalizeDate(completedRaw),
     note: p.note ? normalizeNote(plainText(propById(page, p.note)?.rich_text)) : null,
     domainIds: p.domain ? (propById(page, p.domain)?.relation ?? []).map((r) => r.id) : [],
+    projectIds: p.project ? (propById(page, p.project)?.relation ?? []).map((r) => r.id) : [],
     didaId: didaRaw || null,
     inTrash: !!(page.in_trash || page.archived),
     createdTime: page.created_time,
@@ -143,6 +157,8 @@ export interface TaskPatch {
   completedAt?: NotionDateValue | null
   note?: string
   domain?: DomainChange
+  /** 同步写入的项目：set 为期望值，remove 为上次写入、现在不再需要的值 */
+  projects?: { set: string[]; remove: string[] }
   didaId?: string
 }
 
@@ -158,6 +174,7 @@ export function patchFields(p: TaskPatch): string[] {
     completedAt: '完成日期',
     note: '下一步做什么？',
     domain: '二级领域',
+    projects: '关联项目',
     didaId: '滴答ID'
   }
   return (Object.keys(p) as Array<keyof TaskPatch>).map((k) => names[k])
@@ -174,11 +191,21 @@ export function diffAgainstWritten(desired: DesiredTask, written: WrittenTask): 
   if (desired.domainPageId !== written.domainPageId) {
     patch.domain = { set: desired.domainPageId, remove: written.domainPageId }
   }
+  if (desired.projectPageIds) {
+    const before = written.projectPageIds ?? []
+    if (before.join('|') !== desired.projectPageIds.join('|'))
+      patch.projects = { set: desired.projectPageIds, remove: before.filter((id) => !desired.projectPageIds!.includes(id)) }
+  }
   return patch
 }
 
 /** Notion 侧校正：和页面实际值比较（未完成组内的具体状态不管） */
-export function diffAgainstActual(desired: DesiredTask, actual: ActualTask, writtenDomain: string | null): TaskPatch {
+export function diffAgainstActual(
+  desired: DesiredTask,
+  actual: ActualTask,
+  writtenDomain: string | null,
+  writtenProjects: string[] | null = null
+): TaskPatch {
   const patch: TaskPatch = {}
   if (desired.title !== actual.title.trim()) patch.title = desired.title
   if (actual.statusGroup !== desired.statusGroup) patch.status = desired.statusGroup
@@ -195,8 +222,20 @@ export function diffAgainstActual(desired: DesiredTask, actual: ActualTask, writ
       patch.domain = { set: wantDomain, remove: writtenDomain && writtenDomain !== wantDomain ? writtenDomain : null }
     }
   }
+  if (desired.projectPageIds) {
+    const missing = desired.projectPageIds.filter((id) => !actual.projectIds.includes(id))
+    const stale = (writtenProjects ?? []).filter((id) => !desired.projectPageIds!.includes(id) && actual.projectIds.includes(id))
+    if (missing.length || stale.length) patch.projects = { set: desired.projectPageIds, remove: stale }
+  }
   if (actual.didaId !== desired.didaId) patch.didaId = desired.didaId
   return patch
+}
+
+/** 多值关系：去掉同步不再需要的值，补上期望值，保留手动添加的其它值 */
+export function mergeRelationMulti(current: string[], change: { set: string[]; remove: string[] }): string[] {
+  const next = current.filter((id) => !change.remove.includes(id))
+  for (const id of change.set) if (!next.includes(id)) next.push(id)
+  return next
 }
 
 /** 合并关系字段：只替换同步写入的那一个值，保留其它值 */
@@ -214,7 +253,8 @@ export function statusOptionFor(schema: FlowSchema, group: StatusGroup): string 
 export function buildProperties(
   patch: TaskPatch,
   schema: FlowSchema,
-  relationIds?: string[]
+  relationIds?: string[],
+  projectIds?: string[]
 ): Record<string, unknown> {
   const p = schema.tasks.props
   const props: Record<string, unknown> = {}
@@ -224,6 +264,7 @@ export function buildProperties(
   if (patch.completedAt !== undefined && p.completedAt) props[p.completedAt] = { date: patch.completedAt }
   if (patch.note !== undefined && p.note) props[p.note] = { rich_text: toRichText(patch.note) }
   if (patch.domain !== undefined && p.domain && relationIds) props[p.domain] = { relation: relationIds.map((id) => ({ id })) }
+  if (patch.projects !== undefined && p.project && projectIds) props[p.project] = { relation: projectIds.map((id) => ({ id })) }
   if (patch.didaId !== undefined) props[p.didaId] = { rich_text: toRichText(patch.didaId) }
   return props
 }
@@ -238,10 +279,12 @@ export function buildCreateProperties(desired: DesiredTask, schema: FlowSchema, 
       completedAt: desired.completedValue,
       note: desired.note ?? undefined,
       didaId: desired.didaId,
-      domain: domainId ? { set: domainId, remove: null } : undefined
+      domain: domainId ? { set: domainId, remove: null } : undefined,
+      projects: desired.projectPageIds?.length ? { set: desired.projectPageIds, remove: [] } : undefined
     },
     schema,
-    domainId ? [domainId] : undefined
+    domainId ? [domainId] : undefined,
+    desired.projectPageIds ?? undefined
   )
   if (desired.scheduleValue === null) delete props[p.schedule]
   if (desired.completedValue === null && p.completedAt) delete props[p.completedAt]

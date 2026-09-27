@@ -4,6 +4,7 @@ import type {
   DidaGroup,
   DidaPreference,
   DidaProject,
+  DidaTag,
   DidaTask,
   NotionDataSource,
   NotionPage,
@@ -95,6 +96,13 @@ export class FakeDida implements DidaReader {
     const t = this.tasks.get(taskId)
     return t && t.projectId === projectId ? structuredClone(t) : null
   }
+  async listTags(): Promise<DidaTag[]> {
+    this.check('tags')
+    const names = new Set<string>()
+    for (const t of this.tasks.values()) for (const tag of t.tags ?? []) names.add(tag)
+    return [...names].map((name) => ({ name, label: name }))
+  }
+
   async listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]> {
     this.check(`focus:${type}`)
     if (to.getTime() - from.getTime() > 30 * 86_400_000) throw new CliError('DIDA API 错误 400: range > 30 days', 'dida', 'validation', 400)
@@ -127,8 +135,17 @@ interface FakeDs {
   pages: Map<string, NotionPage>
 }
 
+export interface FakeBlock {
+  id: string
+  type: string
+  content: Record<string, unknown>
+  children: FakeBlock[]
+}
+
 export class FakeNotion implements NotionClient {
   readonly sources = new Map<string, FakeDs>()
+  /** 页面/块 → 子块 */
+  readonly blocks = new Map<string, FakeBlock[]>()
   calls: string[] = []
   writes = 0
   failWith: CliError | null = null
@@ -310,6 +327,54 @@ export class FakeNotion implements NotionClient {
     return structuredClone(this.seedPage(dsId, body.properties ?? {}))
   }
 
+  private toBlock(req: any): FakeBlock {
+    const type = req.type as string
+    const { children, ...content } = req[type] ?? {}
+    const block: FakeBlock = { id: randomUUID(), type, content, children: [] }
+    if (Array.isArray(children)) {
+      block.children = children.map((c: any) => this.toBlock(c))
+      this.blocks.set(block.id, block.children)
+    }
+    return block
+  }
+
+  async appendBlocks(parentId: string, children: unknown[], position?: { type: string; after_block?: { id: string } }) {
+    this.check('appendBlocks')
+    if (children.length > 100) throw new CliError('validation: children > 100', 'ntn', 'validation', 400)
+    this.writes++
+    const list = this.blocks.get(parentId) ?? []
+    const created = children.map((c) => this.toBlock(c))
+    if (position?.type === 'page_start') list.unshift(...created)
+    else if (position?.type === 'after_block') {
+      const at = list.findIndex((b) => b.id === position.after_block?.id)
+      list.splice(at + 1, 0, ...created)
+    } else list.push(...created)
+    this.blocks.set(parentId, list)
+    return { results: created.map((b) => ({ id: b.id, type: b.type })) }
+  }
+
+  async deleteBlock(id: string): Promise<void> {
+    this.check('deleteBlock')
+    this.writes++
+    for (const [parent, list] of this.blocks) {
+      const i = list.findIndex((b) => b.id === id)
+      if (i >= 0) {
+        list.splice(i, 1)
+        this.blocks.set(parent, list)
+      }
+    }
+  }
+
+  async listBlocks(id: string) {
+    this.check('listBlocks')
+    return (this.blocks.get(id) ?? []).map((b) => ({ id: b.id, type: b.type, has_children: b.children.length > 0, [b.type]: b.content }))
+  }
+
+  /** 测试用：页面正文的块树 */
+  blockTree(id: string): FakeBlock[] {
+    return this.blocks.get(id) ?? []
+  }
+
   async updatePage(id: string, body: Record<string, any>): Promise<NotionPage> {
     this.check('updatePage')
     this.writes++
@@ -327,6 +392,7 @@ export class FakeNotion implements NotionClient {
 export const FLOW_IDS = {
   tasks: 'ds-tasks-0000-0000-0000-000000000001',
   focus: 'ds-focus-0000-0000-0000-000000000004',
+  projects: 'ds-projects-00-0000-0000-000000000005',
   domains: 'ds-domains-000-0000-0000-000000000002',
   areas: 'ds-areas-0000-0000-0000-000000000003',
   status: { collect: 'st-collect', shelve: 'st-shelve', todo: 'st-todo', doing: 'st-doing', done: 'st-done', abandoned: 'st-abandoned' },
@@ -367,7 +433,7 @@ export function createFlowWorkspace(notion: FakeNotion, opts: { withDidaId?: boo
     完成日期: { id: 'p_done', name: '完成日期', type: 'date' },
     '下一步做什么？': { id: 'p_note', name: '下一步做什么？', type: 'rich_text' },
     二级领域: { id: 'p_domain', name: '二级领域', type: 'relation', relation: { data_source_id: FLOW_IDS.domains } },
-    关联项目: { id: 'p_project', name: '关联项目', type: 'relation', relation: { data_source_id: 'ds-projects' } },
+    关联项目: { id: 'p_project', name: '关联项目', type: 'relation', relation: { data_source_id: FLOW_IDS.projects } },
     关联番茄: { id: 'p_pomo', name: '关联番茄', type: 'relation', relation: { data_source_id: FLOW_IDS.focus } }
   }
   if (opts.withDidaId) taskProps['滴答ID'] = { id: 'p_滴答ID', name: '滴答ID', type: 'rich_text' }
@@ -378,6 +444,14 @@ export function createFlowWorkspace(notion: FakeNotion, opts: { withDidaId?: boo
     properties: {
       二级领域: { id: 'title', name: '二级领域', type: 'title' },
       'FLOW - 一级领域': { id: 'p_area', name: 'FLOW - 一级领域', type: 'relation', relation: { data_source_id: FLOW_IDS.areas } }
+    }
+  })
+  notion.addDataSource({
+    id: FLOW_IDS.projects,
+    title: [{ plain_text: 'FLO.W - 我的项目 DB · Max' }],
+    properties: {
+      Name: { id: 'title', name: 'Name', type: 'title' },
+      关联任务: { id: 'pr_tasks', name: '关联任务', type: 'relation', relation: { data_source_id: FLOW_IDS.tasks } }
     }
   })
   notion.addDataSource({

@@ -58,6 +58,7 @@ test('首次设置向导（演示模式）', async () => {
   await expect(page.getByText('首次同步预览')).toBeVisible()
   await expect(page.getByText('关联已有任务')).toBeVisible({ timeout: 15_000 })
   await expect(page.getByText('番茄记录')).toBeVisible()
+  await expect(page.getByText(/个任务会按标签关联到 FLO.W 项目/)).toBeVisible()
   await shot(page, '09-preview')
   await page.getByRole('button', { name: /备份并开始首次同步/ }).click()
   await expect(page.getByText('首次同步完成')).toBeVisible({ timeout: 20_000 })
@@ -80,6 +81,8 @@ test('主界面各页面（演示模式，已配置）', async () => {
 
   await page.getByRole('menuitem', { name: '领域映射' }).click()
   await expect(page.getByText('客户项目').first()).toBeVisible({ timeout: 10_000 })
+  await expect(page.getByText('#v2.3版本发布')).toBeVisible()
+  await expect(page.getByText('v2.3 版本发布', { exact: true })).toBeVisible()
   await shot(page, '22-mapping')
 
   await page.getByRole('menuitem', { name: '同步记录' }).click()

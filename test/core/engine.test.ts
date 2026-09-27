@@ -3,7 +3,7 @@ import { FLOW_IDS } from '../../src/core/adapters/fake'
 import { CliError } from '../../src/core/adapters/exec'
 import { NeedsInitialSyncError } from '../../src/core/sync/engine'
 import { MemoryStateStore } from '../../src/core/sync/state'
-import { advance, areaPages, domainPages, makeWorld, pageByDidaId, prop, taskPages, titleOf, type World } from './helpers'
+import { advance, areaPages, domainPages, makeWorld, pageByDidaId, prop, syncSection, taskPages, titleOf, type World } from './helpers'
 
 const S = FLOW_IDS.status
 
@@ -50,7 +50,9 @@ describe('initial sync', () => {
     expect(titleOf(p1)).toBe('上线新版本')
     expect(prop(p1, '状态')?.status?.id).toBe(S.todo)
     expect(prop(p1, '排期')?.date).toEqual({ start: '2026-09-28T14:00:00+08:00', end: null })
-    expect(titleOf(p1, '下一步做什么？')).toBe('先跑回归测试')
+    // 描述写进页面顶部同步区，「下一步做什么？」留空给用户和 Claude
+    expect(titleOf(p1, '下一步做什么？')).toBe('')
+    expect(syncSection(w, p1.id)).toEqual(['先跑回归测试'])
     expect(prop(p1, '任务类型')?.select?.id).toBe(FLOW_IDS.type.schedule)
 
     const devDomain = domainPages(w).find((d) => titleOf(d, '二级领域') === '开发')!
@@ -93,7 +95,8 @@ describe('initial sync', () => {
     // 未完成组内的具体状态（执行）保留，Notion 专属字段不动
     expect(prop(page, '状态')?.status?.id).toBe(S.doing)
     expect(prop(page, '关联项目')?.relation).toEqual([{ id: 'proj-1' }])
-    expect(titleOf(page, '下一步做什么？')).toBe('本周进展')
+    expect(titleOf(page, '下一步做什么？')).toBe('')
+    expect(syncSection(w, page.id)).toEqual(['本周进展'])
     expect(domainPages(w).filter((d) => titleOf(d, '二级领域') === '开发')).toHaveLength(1)
     expect(areaPages(w).filter((a) => titleOf(a, '一级领域') === '工作')).toHaveLength(1)
   })

@@ -1,4 +1,5 @@
 import { FakeDida, FakeNotion, FLOW_IDS, createFlowWorkspace } from './adapters/fake'
+import type { DidaTask } from './types'
 
 /** 演示模式（FLOWSYNC_FAKE=1）：不连接真实账号，用内存数据展示完整流程 */
 
@@ -31,14 +32,33 @@ export function createDemoDida(): FakeDida {
     { id: 'p-ideas', name: '灵感笔记', groupId: 'g-study', kind: 'NOTE' }
   ]
   const tz = 'Asia/Shanghai'
-  const add = (id: string, projectId: string, title: string, when: ReturnType<typeof at> | null, content = '') =>
-    dida.addTask({ id, projectId, title, content, timeZone: tz, ...(when ?? {}) })
-  add('d01', 'p-product', '整理 v2.3 需求清单', at(0, null), '先和设计对齐交互稿')
-  add('d02', 'p-product', '评审埋点方案', at(1, 15))
-  add('d03', 'p-product', '发布前回归测试', at(3, null))
+  const add = (
+    id: string,
+    projectId: string,
+    title: string,
+    when: ReturnType<typeof at> | null,
+    content = '',
+    extra: Partial<DidaTask> = {}
+  ) => dida.addTask({ id, projectId, title, content, timeZone: tz, ...(when ?? {}), ...extra })
+  add('d01', 'p-product', '整理 v2.3 需求清单', at(0, null), '先和设计对齐交互稿\n\n- 首页改版\n- **支付流程**优化', { tags: ['v2.3版本发布'] })
+  add('d02', 'p-product', '评审埋点方案', at(1, 15), '', { tags: ['v2.3版本发布'] })
+  add('d03', 'p-product', '发布前回归测试', at(3, null), '', {
+    kind: 'CHECKLIST',
+    desc: '按清单逐项确认',
+    tags: ['v2.3版本发布'],
+    items: [
+      { id: 'i1', title: '跑自动化测试', status: 1, sortOrder: 1 },
+      { id: 'i2', title: '检查埋点上报', status: 0, sortOrder: 2 },
+      { id: 'i3', title: '更新帮助文档', status: 0, sortOrder: 3 }
+    ]
+  })
+  add('d13', 'p-product', 'v2.3 上线', at(5, null), '', { tags: ['v2.3版本发布'] })
+  add('d14', 'p-product', '写发布说明', at(4, null), '', { parentId: 'd13', sortOrder: 1 })
+  add('d15', 'p-product', '灰度 10% 用户', at(5, 10), '', { parentId: 'd13', sortOrder: 2 })
+  add('d16', 'p-english', '英语晨读', at(1, 7), '', { repeatFlag: 'RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,WE,FR', repeatFrom: 0, tags: ['英语提升'] })
   add('d04', 'p-client', '客户周会', at(2, 10), '准备上周进展与风险')
   add('d05', 'p-client', '提交报价单', at(4, null))
-  add('d06', 'p-english', '背 50 个单词', at(0, null))
+  add('d06', 'p-english', '背 50 个单词', at(0, null), '', { tags: ['英语提升'] })
   add('d07', 'p-english', '听力精听 30 分钟', at(1, 21))
   add('d08', 'p-reading', '读完《卡片笔记写作法》第 3 章', null)
   add('d09', 'p-fitness', '跑步 5 公里', at(0, 7))
@@ -49,6 +69,8 @@ export function createDemoDida(): FakeDida {
   dida.addFocus({ id: 'fc2', type: 0, taskId: 'd01', startTime: ago(150), endTime: ago(125), duration: 1500, note: '整理需求优先级' })
   dida.addFocus({ id: 'fc3', type: 1, taskId: 'd08', startTime: ago(600), endTime: ago(540), duration: 3600 })
   dida.addFocus({ id: 'fc4', type: 0, taskId: 'd06', startTime: ago(60), endTime: ago(35), duration: 1500 })
+  // 重复任务“英语晨读”今天早上完成过一次：滴答产生一条已完成副本
+  dida.addTask({ id: 'd16-done', projectId: 'p-english', title: '英语晨读', status: 2, completedTime: ago(180), timeZone: tz })
   dida.addTask({
     id: 'd12',
     projectId: 'p-reading',
@@ -70,6 +92,8 @@ export function createDemoNotion(workspaceName: string, seedExisting = true): Fa
     notion.seedPage(FLOW_IDS.areas, { title: title('学习') })
     notion.seedPage(FLOW_IDS.domains, { title: title('产品开发'), p_area: { relation: [{ id: work.id }] } })
     notion.seedPage(FLOW_IDS.domains, { title: title('英语') })
+    notion.seedPage(FLOW_IDS.projects, { title: title('v2.3 版本发布') })
+    notion.seedPage(FLOW_IDS.projects, { title: title('英语提升') })
     notion.seedPage(FLOW_IDS.tasks, {
       title: title('客户周会'),
       p_status: { status: { id: FLOW_IDS.status.doing } },

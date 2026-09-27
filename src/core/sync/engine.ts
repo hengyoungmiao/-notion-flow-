@@ -8,6 +8,7 @@ import {
   buildProperties,
   diffAgainstActual,
   mergeRelation,
+  mergeRelationMulti,
   patchFields,
   propById,
   readActual,
@@ -17,6 +18,7 @@ import {
 } from '../mapping/task'
 import { plainText, toRichText } from '../mapping/text'
 import { buildFocusProperties, focusPageStartKey } from '../mapping/focus'
+import { BODY_TITLE, containerBlock } from '../mapping/body'
 import { missingInWindow, planFocus, type FocusOp } from './focus'
 import type {
   AppSettings,
@@ -33,7 +35,7 @@ import type {
   WorkspaceState
 } from '../types'
 import { evaluateBreaker, safeSubset } from './guard'
-import { countOps, describeOp, isInbox, planTasks, type PlanCounts, type TaskOp } from './planner'
+import { countOps, describeOp, isInbox, planTasks, projectKey, type PlanCounts, type TaskOp } from './planner'
 import type { StateStore } from './state'
 
 export interface EngineDeps {
@@ -76,6 +78,10 @@ export interface RoundSummary {
   domainRows: DomainPlan['rows']
   /** 番茄钟/正计时记录 */
   focus: { creates: number; updates: number; trashes: number }
+  /** 需要写入/更新同步区的任务数 */
+  bodies: number
+  /** 将按标签关联项目的任务数 */
+  projectLinks: number
   warnings: string[]
 }
 
@@ -97,6 +103,8 @@ interface Structure {
   preference: DidaPreference
   domains: NotionDomainPage[]
   areas: NotionAreaPage[]
+  /** FLO.W 项目（按标签匹配） */
+  flowProjects: Array<{ pageId: string; title: string }>
 }
 
 interface FocusLoad {
@@ -107,6 +115,8 @@ interface FocusLoad {
 }
 
 const FOCUS_INTERVAL_MS = 60_000
+/** 每轮最多重写的同步区数量 */
+const BODY_LIMIT = 40
 
 export class NeedsInitialSyncError extends Error {
   constructor() {
@@ -164,7 +174,15 @@ export class SyncEngine {
         title: plainText(propById(p, a.props.title)?.title)
       }))
     }
-    this.structure = { at: this.now().getTime(), projects, groups, preference, domains, areas }
+    let flowProjects: Array<{ pageId: string; title: string }> = []
+    if (schema.projects && this.deps.settings.syncProjects) {
+      const pr = schema.projects
+      flowProjects = (await queryAll(notion, pr.dataSourceId)).map((p) => ({
+        pageId: p.id,
+        title: plainText(propById(p, pr.props.title)?.title)
+      }))
+    }
+    this.structure = { at: this.now().getTime(), projects, groups, preference, domains, areas, flowProjects }
     return this.structure
   }
 
@@ -273,6 +291,7 @@ export class SyncEngine {
     warnings: string[]
     notionDomains: Array<{ pageId: string; title: string }>
     notionAreas: Array<{ pageId: string; title: string }>
+    tagProjects: Array<{ tag: string; projectTitle: string | null }> | null
   }> {
     const schema = this.schema
     const state = await this.deps.store.load(this.deps.profile.id)
@@ -292,8 +311,19 @@ export class SyncEngine {
       rows: plan.rows,
       warnings: plan.warnings,
       notionDomains: structure.domains.map((d) => ({ pageId: d.pageId, title: d.title })),
-      notionAreas: structure.areas.map((a) => ({ pageId: a.pageId, title: a.title }))
+      notionAreas: structure.areas.map((a) => ({ pageId: a.pageId, title: a.title })),
+      tagProjects: await this.tagProjectTable(structure)
     }
+  }
+
+  /** 标签 → 项目对照（界面展示用）；未启用或没有项目库时返回 null */
+  private async tagProjectTable(structure: Structure): Promise<Array<{ tag: string; projectTitle: string | null }> | null> {
+    if (!this.schema.projects || !this.deps.settings.syncProjects) return null
+    const byKey = new Map(structure.flowProjects.map((p) => [projectKey(p.title), p.title]))
+    const tags = await this.deps.dida.listTags().catch(() => [])
+    return tags
+      .map((t) => ({ tag: t.label || t.name, projectTitle: byKey.get(projectKey(t.name)) ?? byKey.get(projectKey(t.label)) ?? null }))
+      .sort((a, b) => Number(!!b.projectTitle) - Number(!!a.projectTitle) || a.tag.localeCompare(b.tag))
   }
 
   // ───────────────────────── 一轮同步 ─────────────────────────
@@ -360,6 +390,7 @@ export class SyncEngine {
       linkedPages,
       pageChecks,
       candidates,
+      projects: structure.flowProjects,
       initial,
       now
     })
@@ -569,7 +600,10 @@ export class SyncEngine {
       etag: etag ?? prev?.etag,
       createdBySync: prev?.createdBySync ?? createdBySync,
       linkedAt: prev?.linkedAt ?? nowIso,
-      lastSeenAt: nowIso
+      lastSeenAt: nowIso,
+      parentDidaId: desired.parentDidaId,
+      body: prev?.pageId === pageId ? prev?.body : undefined,
+      history: prev?.history
     }
   }
 
@@ -583,10 +617,12 @@ export class SyncEngine {
     return found[0] ?? null
   }
 
-  private async applyTaskOps(ops: TaskOp[], state: WorkspaceState, writes: { count: number }): Promise<void> {
+  private async applyTaskOps(allOps: TaskOp[], state: WorkspaceState, writes: { count: number }): Promise<void> {
     const schema = this.schema
     const { notion, settings } = this.deps
     let sinceSave = 0
+    // 同步区最后写（新建的页面此时已有 ID），每轮最多 BODY_LIMIT 个，其余下一轮继续
+    const ops = [...allOps.filter((o) => o.kind !== 'body'), ...allOps.filter((o) => o.kind === 'body').slice(0, BODY_LIMIT)]
     for (const op of ops) {
       try {
         switch (op.kind) {
@@ -658,6 +694,9 @@ export class SyncEngine {
             }
             break
           }
+          case 'body':
+            writes.count += await this.applyBody(op, state)
+            break
         }
       } catch (e) {
         if (e instanceof CliError && (e.kind === 'validation' || e.kind === 'not_found')) {
@@ -673,6 +712,40 @@ export class SyncEngine {
     }
   }
 
+  /** 重写页面顶部的同步区：删除旧 callout，在页面最前面追加新的（超过 100 个子块时分批） */
+  private async applyBody(op: Extract<TaskOp, { kind: 'body' }>, state: WorkspaceState): Promise<number> {
+    const link = state.tasks[op.didaId]
+    const pageId = op.pageId ?? link?.pageId
+    if (!link || !pageId || link.pageId !== pageId) return 0
+    const { notion } = this.deps
+    let writes = 0
+    if (link.body?.blockId) {
+      await notion.deleteBlock(link.body.blockId)
+      writes++
+    } else if (!link.body) {
+      // 第一次写（或本地状态丢失）：先清理页面上已有的同步区，避免出现两个
+      for (const b of await notion.listBlocks(pageId)) {
+        if (b.type === 'callout' && isSyncCallout(b)) {
+          await notion.deleteBlock(b.id)
+          writes++
+        }
+      }
+    }
+    let blockId: string | null = null
+    if (op.spec) {
+      const res = await notion.appendBlocks(pageId, [containerBlock(op.spec.blocks)], { type: 'page_start' })
+      writes++
+      blockId = res.results[0]?.id ?? null
+      for (let i = 100; blockId && i < op.spec.blocks.length; i += 100) {
+        await notion.appendBlocks(blockId, op.spec.blocks.slice(i, i + 100))
+        writes++
+      }
+    }
+    link.body = { blockId, hash: op.spec?.hash ?? null }
+    if (op.history) link.history = op.history
+    return writes
+  }
+
   private async applyUpdate(
     desired: DesiredTask,
     pageId: string,
@@ -685,18 +758,21 @@ export class SyncEngine {
     let patch = patchIn
     // 领域变化时先读取当前关系，只替换同步写入的值
     let relationIds: string[] | undefined
-    if (patch.domain) {
+    let projectIds: string[] | undefined
+    if (patch.domain || patch.projects) {
       const current = actual ?? (await this.pageActual(pageId))
       if (!current) {
         delete state.tasks[desired.didaId]
         state.notionRemoved[desired.didaId] = { pageId, title: desired.title, at: this.now().toISOString() }
         return
       }
-      relationIds = mergeRelation(current.domainIds, { ...patch.domain, set: this.resolveDomainId(patch.domain.set, state) })
+      if (patch.domain)
+        relationIds = mergeRelation(current.domainIds, { ...patch.domain, set: this.resolveDomainId(patch.domain.set, state) })
+      if (patch.projects) projectIds = mergeRelationMulti(current.projectIds, patch.projects)
     }
     const linkedHere = state.tasks[desired.didaId]?.pageId === pageId
     if (!linkedHere && actual?.didaId !== desired.didaId) patch = { ...patch, didaId: desired.didaId }
-    const properties = buildProperties(patch, schema, relationIds)
+    const properties = buildProperties(patch, schema, relationIds, projectIds)
     if (Object.keys(properties).length > 0) {
       await this.deps.notion.updatePage(pageId, { properties })
       writes.count++
@@ -807,6 +883,12 @@ function summarize(ops: TaskOp[], domainPlan: DomainPlan, warnings: string[]): R
     domainCreates: [],
     domainRows: domainPlan.rows,
     focus: { creates: 0, updates: 0, trashes: 0 },
+    bodies: ops.filter((o) => o.kind === 'body').length,
+    projectLinks: ops.filter(
+      (o) =>
+        (o.kind === 'create' && (o.desired.projectPageIds?.length ?? 0) > 0) ||
+        (o.kind === 'update' && !!o.patch.projects && o.patch.projects.set.length > 0)
+    ).length,
     warnings
   }
   for (const op of ops) {
@@ -833,4 +915,9 @@ function countFocus(ops: FocusOp[]): RoundSummary['focus'] {
     updates: ops.filter((o) => o.kind === 'focusUpdate').length,
     trashes: ops.filter((o) => o.kind === 'focusTrash').length
   }
+}
+
+function isSyncCallout(block: Record<string, unknown>): boolean {
+  const rich = ((block.callout as { rich_text?: Array<{ plain_text?: string; text?: { content?: string } }> } | undefined)?.rich_text ?? [])
+  return rich.map((r) => r.plain_text ?? r.text?.content ?? '').join('') === BODY_TITLE
 }

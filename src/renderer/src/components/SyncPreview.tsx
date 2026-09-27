@@ -64,6 +64,12 @@ export function SyncPreview({ summary }: { summary: RoundSummary }) {
           </Card>
         </Col>
       </Row>
+      {(summary.bodies > 0 || summary.projectLinks > 0) && (
+        <Typography.Paragraph type="secondary">
+          另外：{summary.bodies} 个任务会在页面顶部写入滴答同步区（描述、检查事项、子任务、重复规则），{summary.projectLinks}{' '}
+          个任务会按标签关联到 FLO.W 项目。
+        </Typography.Paragraph>
+      )}
       {summary.warnings.map((w) => (
         <Alert key={w} type="warning" showIcon message={w} style={{ marginBottom: 8 }} />
       ))}

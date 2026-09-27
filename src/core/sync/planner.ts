@@ -1,4 +1,7 @@
+import { buildBody, type BodySpec } from '../mapping/body'
+import { didaCompletedToNotion } from '../mapping/dates'
 import type { DomainPlan } from '../mapping/domains'
+import { describeRepeat } from '../mapping/recurrence'
 import { KEEP } from '../mapping/domains'
 import {
   desiredFromDida,
@@ -7,11 +10,14 @@ import {
   isEmptyPatch,
   patchFields,
   type ActualTask,
+  taskDescription,
   type MapContext,
   type TaskPatch
 } from '../mapping/task'
 import { normalizeTitle } from '../mapping/text'
 import type { AppSettings, DesiredTask, DidaTask, FlowSchema, TaskLink, WorkspaceProfile, WorkspaceState } from '../types'
+
+export type TaskHistory = NonNullable<TaskLink['history']>
 
 export type TaskOp =
   | { kind: 'create'; desired: DesiredTask }
@@ -30,6 +36,8 @@ export type TaskOp =
   | { kind: 'unlink'; didaId: string; pageId: string; title: string; reason: 'out_of_scope' | 'deleted' }
   | { kind: 'removed'; didaId: string; pageId: string; title: string }
   | { kind: 'touch'; didaId: string; projectId: string; etag?: string }
+  /** 页面顶部同步区：spec 为 null 表示删除同步区；pageId 为 null 表示本轮新建的页面 */
+  | { kind: 'body'; didaId: string; pageId: string | null; title: string; spec: BodySpec | null; history?: TaskHistory }
 
 export interface PlanInput {
   state: WorkspaceState
@@ -48,6 +56,8 @@ export interface PlanInput {
   pageChecks: Map<string, ActualTask | null>
   /** 首次同步：没有滴答ID的未完成页面（用于按标题配对） */
   candidates: ActualTask[] | null
+  /** FLO.W 项目（用于按标签匹配） */
+  projects?: Array<{ pageId: string; title: string }>
   initial: boolean
   now: Date
 }
@@ -63,12 +73,32 @@ export function isInbox(projectId: string): boolean {
 
 /** 重复任务每次完成产生的记录（滴答会生成一条已完成副本）；判断规则待真实样例校准 */
 export function isRecurringOccurrence(task: DidaTask, openTasks: DidaTask[]): boolean {
-  if (task.status !== 2) return false
-  if (task.repeatTaskId && task.repeatTaskId !== task.id) return true
+  return occurrenceParent(task, openTasks) !== null
+}
+
+/** 重复任务完成副本对应的原任务 ID（优先 repeatTaskId，其次同清单同标题的未完成重复任务） */
+export function occurrenceParent(task: DidaTask, openTasks: DidaTask[]): string | null {
+  if (task.status !== 2) return null
+  if (task.repeatTaskId && task.repeatTaskId !== task.id) return task.repeatTaskId
   const title = normalizeTitle(task.title)
-  return openTasks.some(
+  const origin = openTasks.find(
     (o) => o.id !== task.id && !!o.repeatFlag && o.projectId === task.projectId && normalizeTitle(o.title) === title
   )
+  return origin?.id ?? null
+}
+
+/** 标签/项目名归一化：忽略全半角、大小写、空格、# 和常见标点 */
+export function projectKey(name: string | null | undefined): string {
+  return (name ?? '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '')
+}
+
+function mergeHistory(prev: TaskHistory | undefined, adds: Array<{ id: string; date: string }>): TaskHistory | undefined {
+  if (!adds.length) return prev
+  const ids = new Set(prev?.ids ?? [])
+  const fresh = adds.filter((a) => !ids.has(a.id))
+  if (!fresh.length) return prev
+  const dates = [...(prev?.dates ?? []), ...fresh.map((a) => a.date)].sort().slice(-20)
+  return { dates, count: (prev?.count ?? 0) + fresh.length, ids: [...ids, ...fresh.map((a) => a.id)].slice(-50) }
 }
 
 function dayOfRaw(value: { start: string } | null | undefined): string | null {
@@ -87,6 +117,25 @@ export function planTasks(input: PlanInput): PlanResult {
     return domainPlan.scopeProjectIds.has(t.projectId)
   }
 
+  const taskById = new Map(input.tasks.map((t) => [t.id, t]))
+  const projectIndex = new Map<string, string>()
+  for (const p of input.projects ?? []) {
+    const key = projectKey(p.title)
+    if (key && !projectIndex.has(key)) projectIndex.set(key, p.pageId)
+  }
+  const tagProjects = (tags: string[] | undefined): string[] => [
+    ...new Set((tags ?? []).map((t) => projectIndex.get(projectKey(t))).filter((id): id is string => !!id))
+  ]
+  const projectsFor = (task: DidaTask): string[] | null => {
+    if (!settings.syncProjects || !schema.projects) return null
+    const own = tagProjects(task.tags)
+    if (own.length || !task.parentId) return own
+    // 子任务没有匹配到项目时继承父任务的项目
+    const parent = taskById.get(task.parentId)
+    if (parent) return tagProjects(parent.tags)
+    return state.tasks[task.parentId]?.written.projectPageIds ?? []
+  }
+
   const ctxFor = (link: TaskLink | undefined): MapContext => ({
     schema,
     settings,
@@ -96,8 +145,11 @@ export function planTasks(input: PlanInput): PlanResult {
       const d = domainPlan.listMap.get(projectId)
       if (d === KEEP) return link?.written.domainPageId ?? null
       return d ?? null
-    }
+    },
+    projectsFor
   })
+  const historyAdds = new Map<string, Array<{ id: string; date: string }>>()
+  const processed: DidaTask[] = []
 
   const openTasks = input.tasks.filter((t) => (t.status ?? 0) === 0)
   const createCutoff = input.initial
@@ -143,6 +195,7 @@ export function planTasks(input: PlanInput): PlanResult {
       return
     }
     if (state.notionRemoved[task.id]) return
+    processed.push(task)
     const desired = desiredFromDida(task, ctxFor(link))
 
     if (link) {
@@ -154,7 +207,7 @@ export function planTasks(input: PlanInput): PlanResult {
           return
         }
         if (checked) {
-          const patch = diffAgainstActual(desired, checked, link.written.domainPageId)
+          const patch = diffAgainstActual(desired, checked, link.written.domainPageId, link.written.projectPageIds ?? [])
           if (!isEmptyPatch(patch)) {
             const fromDida = !isEmptyPatch(diffAgainstWritten(desired, link.written))
             ops.push({
@@ -185,8 +238,17 @@ export function planTasks(input: PlanInput): PlanResult {
     const status = task.status ?? 0
     if (status !== 0) {
       const doneAt = task.completedTime ? Date.parse(task.completedTime.replace(/([+-]\d{2})(\d{2})$/, '$1:$2')) : NaN
+      const origin = occurrenceParent(task, openTasks)
+      if (origin && !settings.recurringCompletionRecords) {
+        // 重复任务每完成一次产生的副本：不建页面，计入原任务的完成记录
+        const date = didaCompletedToNotion(task, {
+          defaultTimeZone: input.userTimeZone || settings.defaultTimeZone,
+          allDayEndExclusive: settings.allDayEndExclusive
+        })?.start
+        if (date) historyAdds.set(origin, [...(historyAdds.get(origin) ?? []), { id: task.id, date }])
+        return
+      }
       if (!(doneAt >= createCutoff)) return
-      if (!settings.recurringCompletionRecords && isRecurringOccurrence(task, openTasks)) return
     }
 
     const existing = pickPage(task.id)
@@ -234,7 +296,69 @@ export function planTasks(input: PlanInput): PlanResult {
     else ops.push({ kind: 'unlink', didaId: link.didaId, pageId: link.pageId, title, reason: 'deleted' })
   }
 
+  if (settings.syncBody) ops.push(...planBodies())
   return { ops, warnings: [...new Set(warnings)] }
+
+  /** 页面顶部“滴答同步区”：重复规则、完成记录、父任务、描述、检查事项、子任务 */
+  function planBodies(): TaskOp[] {
+    const out: TaskOp[] = []
+    const dropped = new Set<string>()
+    const opPage = new Map<string, string | null>()
+    for (const op of ops) {
+      if (op.kind === 'unlink' || op.kind === 'removed' || op.kind === 'trash' || op.kind === 'abandon') dropped.add(op.didaId)
+      else if (op.kind === 'create') opPage.set(op.desired.didaId, null)
+      else if (op.kind === 'update' || op.kind === 'link') opPage.set(op.didaId, op.pageId)
+    }
+    const pageOf = (id: string): string | null => state.tasks[id]?.pageId ?? opPage.get(id) ?? null
+    const known = (id: string) => !dropped.has(id) && (!!state.tasks[id] || opPage.has(id))
+
+    // 父 → 子：本轮读到的子任务 + 本地记录里的子任务
+    const children = new Map<string, Array<{ id: string; title: string; done: boolean; order: number }>>()
+    const seenChild = new Set<string>()
+    for (const t of processed) {
+      if (!t.parentId || !known(t.id)) continue
+      seenChild.add(t.id)
+      children.set(t.parentId, [
+        ...(children.get(t.parentId) ?? []),
+        { id: t.id, title: (t.title ?? '').trim(), done: (t.status ?? 0) !== 0, order: t.sortOrder ?? 0 }
+      ])
+    }
+    for (const link of Object.values(state.tasks)) {
+      if (!link.parentDidaId || seenChild.has(link.didaId) || dropped.has(link.didaId)) continue
+      children.set(link.parentDidaId, [
+        ...(children.get(link.parentDidaId) ?? []),
+        { id: link.didaId, title: link.written.title, done: link.written.statusGroup !== 'open', order: Number.MAX_SAFE_INTEGER }
+      ])
+    }
+
+    for (const t of processed) {
+      if (!known(t.id)) continue
+      const link = state.tasks[t.id]
+      const history = mergeHistory(link?.history, historyAdds.get(t.id) ?? [])
+      const parentId = t.parentId || null
+      const spec = buildBody({
+        repeatText: t.repeatFlag ? describeRepeat(t.repeatFlag, t.repeatFrom) : null,
+        description: taskDescription(t),
+        items: [...(t.items ?? [])]
+          .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+          .map((i) => ({ title: (i.title ?? '').trim(), done: i.status === 1 || i.status === 2 })),
+        children: (children.get(t.id) ?? [])
+          .sort((a, b) => a.order - b.order || a.title.localeCompare(b.title))
+          .map((c) => ({ title: c.title, pageId: pageOf(c.id), done: c.done })),
+        parent: parentId
+          ? {
+              title: (taskById.get(parentId)?.title ?? state.tasks[parentId]?.written.title ?? '父任务').trim(),
+              pageId: pageOf(parentId)
+            }
+          : null,
+        history: history ? { dates: history.dates, count: history.count } : null
+      })
+      const before = link?.body?.hash ?? null
+      if ((spec?.hash ?? null) !== before || history !== link?.history)
+        out.push({ kind: 'body', didaId: t.id, pageId: pageOf(t.id), title: (t.title ?? '').trim(), spec, history })
+    }
+    return out
+  }
 }
 
 export interface PlanCounts {
@@ -277,6 +401,8 @@ export function describeOp(op: TaskOp): string {
       return `解除关联「${op.title}」`
     case 'removed':
       return `Notion 中已删除「${op.title}」`
+    case 'body':
+      return `更新同步区「${op.title}」`
     case 'touch':
       return ''
   }

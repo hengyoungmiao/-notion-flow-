@@ -59,6 +59,8 @@ export interface MappingView {
   warnings: string[]
   notionDomains: Array<{ pageId: string; title: string }>
   notionAreas: Array<{ pageId: string; title: string }>
+  /** 标签 → 项目对照；未启用标签关联项目时为 null */
+  tagProjects: Array<{ tag: string; projectTitle: string | null }> | null
 }
 
 export interface RemovedView {

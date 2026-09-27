@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon'
-import type { DidaFocus, DidaGroup, DidaPreference, DidaProject, DidaTask } from '../types'
+import type { DidaFocus, DidaGroup, DidaPreference, DidaProject, DidaTag, DidaTask } from '../types'
 import { CliError, classifyDidaError, runProcess, summarizeStderr, withRetry } from './exec'
 
 /** 对滴答清单只读：本应用永远不会写入或删除滴答数据 */
@@ -14,6 +14,7 @@ export interface DidaReader {
   getTask(projectId: string, taskId: string): Promise<DidaTask | null>
   /** 收件箱未完成任务；接口不支持时返回 null */
   listInboxTasks(): Promise<DidaTask[] | null>
+  listTags(): Promise<DidaTag[]>
   /** 专注记录（接口单次最多 30 天，调用方负责分段） */
   listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]>
   /** 返回 null 表示 404（记录已删除） */
@@ -114,6 +115,10 @@ export class DidaCliReader implements DidaReader {
       if (e instanceof CliError && (e.kind === 'not_found' || e.kind === 'validation')) return null
       throw e
     }
+  }
+
+  listTags(): Promise<DidaTag[]> {
+    return this.run<DidaTag[]>(['tag', 'list']).then((r) => (Array.isArray(r) ? r : []))
   }
 
   listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]> {

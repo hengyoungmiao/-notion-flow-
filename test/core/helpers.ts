@@ -84,3 +84,14 @@ export function domainPages(w: World): NotionPage[] {
 export function areaPages(w: World): NotionPage[] {
   return w.notion.pagesOf(FLOW_IDS.areas)
 }
+
+/** 页面顶部同步区（callout）里的文字，每个子块一行；to_do 用 [ ] / [x] 前缀，页面提及显示为 @<id> */
+export function syncSection(w: World, pageId: string): string[] | null {
+  const top = w.notion.blockTree(pageId)[0]
+  if (!top || top.type !== 'callout') return null
+  return top.children.map((b) => {
+    const rich = ((b.content as any).rich_text ?? []) as any[]
+    const line = rich.map((r) => (r.type === 'mention' ? `@${r.mention.page.id}` : (r.text?.content ?? ''))).join('')
+    return b.type === 'to_do' ? `${(b.content as any).checked ? '[x]' : '[ ]'} ${line}` : line
+  })
+}

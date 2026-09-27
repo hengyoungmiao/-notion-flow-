@@ -42,6 +42,7 @@ export function safeSubset(ops: TaskOp[]): TaskOp[] {
       o.kind === 'touch' ||
       o.kind === 'unlink' ||
       o.kind === 'removed' ||
+      o.kind === 'body' ||
       (o.kind === 'update' && (o.reason === 'relink' || o.reason === 'match'))
   )
 }

@@ -8,7 +8,7 @@ import { FakeDida } from '../../src/core/adapters/fake'
 
 function result(writes: number): RoundResult {
   return {
-    summary: { counts: { creates: writes, updates: 0, corrections: 0, destructive: 0, links: 0, unlinks: 0 }, creates: [], updates: [], matches: [], destructive: [], domainCreates: [], domainRows: [], focus: { creates: 0, updates: 0, trashes: 0 }, warnings: [] },
+    summary: { counts: { creates: writes, updates: 0, corrections: 0, destructive: 0, links: 0, unlinks: 0 }, creates: [], updates: [], matches: [], destructive: [], domainCreates: [], domainRows: [], focus: { creates: 0, updates: 0, trashes: 0 }, bodies: 0, projectLinks: 0, warnings: [] },
     applied: true,
     blocked: null,
     writes,

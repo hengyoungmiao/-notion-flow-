@@ -36,8 +36,14 @@ export default function Settings({ state }: { state: AppViewState }) {
             <Form.Item label="Notion 侧校正间隔" extra="定期检查 Notion 中同步字段是否被改动，并按滴答的值改回。">
               <InputNumber min={1} max={1440} addonAfter="分钟" value={s.reconcileMinutes} onChange={(v) => v && void save({ reconcileMinutes: v })} />
             </Form.Item>
-            <Form.Item label="滴答任务描述 → 「下一步做什么？」">
-              <Switch checked={s.syncNote} onChange={(v) => void save({ syncNote: v })} />
+            <Form.Item
+              label="页面顶部的滴答同步区"
+              extra="把描述、检查事项（可勾选）、子任务清单、重复规则和完成记录写到任务页面最上方；页面其余正文和「下一步做什么？」不受影响。"
+            >
+              <Switch checked={s.syncBody} onChange={(v) => void save({ syncBody: v })} />
+            </Form.Item>
+            <Form.Item label="滴答标签自动关联 FLO.W 项目" extra="任务打上与项目同名的标签（如 #网站改版）就会关联到该项目，项目进度随之更新；子任务继承父任务的项目。">
+              <Switch checked={s.syncProjects} onChange={(v) => void save({ syncProjects: v })} />
             </Form.Item>
             <Form.Item label="同步番茄钟和正计时记录" extra="写入 FLO.W「任务番茄数据库」，并关联到对应任务；任务的「番茄时长统计」会自动计算。">
               <Space>
