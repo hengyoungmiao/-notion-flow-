@@ -69,3 +69,78 @@ describe('planDomains', () => {
     expect(plan.rows.filter((r) => r.status === 'excluded')).toHaveLength(2)
   })
 })
+
+describe('「新建同名」只执行一次', () => {
+  it('已经新建过且页面还在：沿用，不再新建', () => {
+    const state = emptyState('w')
+    state.domains.lists.p1 = { didaId: 'p1', pageId: 'D-new', mode: 'created', lastName: '开发', writtenAreaPageId: null }
+    state.domains.groups.g1 = { didaId: 'g1', pageId: 'A-new', mode: 'created', lastName: '工作', writtenAreaPageId: null }
+    const plan = planDomains(
+      input({
+        state,
+        notionAreas: [{ pageId: 'A-new', title: '工作' }],
+        notionDomains: [{ pageId: 'D-new', title: '开发', areaIds: ['A-new'] }],
+        profile: {
+          scope: { excludedLists: [], includeInbox: true, importCompletedDays: 0 },
+          mappings: { lists: { p1: { mode: 'create' } }, groups: { g1: { mode: 'create' } } }
+        }
+      })
+    )
+    expect(plan.ops.filter((o) => o.kind === 'createDomain' && o.projectId === 'p1')).toHaveLength(0)
+    expect(plan.ops.filter((o) => o.kind === 'createArea')).toHaveLength(0)
+    expect(plan.listMap.get('p1')).toBe('D-new')
+  })
+
+  it('新建的页面被删了，或原来是自动关联的：才会新建', () => {
+    const state = emptyState('w')
+    state.domains.lists.p1 = { didaId: 'p1', pageId: 'GONE', mode: 'created', lastName: '开发', writtenAreaPageId: null }
+    state.domains.lists.p2 = { didaId: 'p2', pageId: 'D2', mode: 'auto', lastName: '阅读', writtenAreaPageId: null }
+    const plan = planDomains(
+      input({
+        state,
+        notionDomains: [{ pageId: 'D2', title: '阅读', areaIds: [] }],
+        profile: {
+          scope: { excludedLists: [], includeInbox: true, importCompletedDays: 0 },
+          mappings: { lists: { p1: { mode: 'create' }, p2: { mode: 'create' } }, groups: {} }
+        }
+      })
+    )
+    expect(plan.ops.filter((o) => o.kind === 'createDomain').map((o) => (o as { projectId: string }).projectId).sort()).toEqual(['p1', 'p2'])
+  })
+})
+
+describe('已归档 / 已删除的清单', () => {
+  it('映射表显示为已归档、已删除，没有警告，不进入同步范围', () => {
+    const state = emptyState('w')
+    state.domains.lists.p3 = { didaId: 'p3', pageId: 'D3', mode: 'auto', lastName: '归档', writtenAreaPageId: null }
+    state.domains.lists.gone = { didaId: 'gone', pageId: 'D9', mode: 'auto', lastName: '旧清单', writtenAreaPageId: null }
+    state.lists.deleted.gone = { name: '旧清单', at: '2026-09-27T08:00:00.000Z' }
+    const plan = planDomains(
+      input({
+        state,
+        notionDomains: [
+          { pageId: 'D3', title: '归档领域', areaIds: [] },
+          { pageId: 'D9', title: '旧领域', areaIds: [] }
+        ]
+      })
+    )
+    expect(plan.warnings).toEqual([])
+    expect(plan.scopeProjectIds.has('p3')).toBe(false)
+    expect(plan.rows.find((r) => r.didaId === 'p3')).toMatchObject({ status: 'archived', notionTitle: '归档领域' })
+    expect(plan.rows.find((r) => r.didaId === 'gone')).toMatchObject({ status: 'deleted', didaName: '旧清单', notionTitle: '旧领域' })
+  })
+
+  it('从没同步过的旧归档清单不显示', () => {
+    const plan = planDomains(input())
+    expect(plan.rows.some((r) => r.didaId === 'p3')).toBe(false)
+  })
+
+  it('同名新清单可以接回已删除清单原来的二级领域', () => {
+    const state = emptyState('w')
+    state.domains.lists.gone = { didaId: 'gone', pageId: 'D1', mode: 'auto', lastName: '开发', writtenAreaPageId: null }
+    state.lists.deleted.gone = { name: '开发', at: '2026-09-27T08:00:00.000Z' }
+    const plan = planDomains(input({ state, notionDomains: [{ pageId: 'D1', title: '开发', areaIds: [] }] }))
+    expect(plan.listMap.get('p1')).toBe('D1')
+    expect(plan.ops.some((o) => o.kind === 'createDomain' && o.projectId === 'p1')).toBe(false)
+  })
+})

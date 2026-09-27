@@ -41,6 +41,16 @@ describe('markdownToBlocks', () => {
     expect(rich.some((r) => r.text?.content === '[图片]')).toBe(true)
   })
 
+  it('only writes links Notion accepts; bare links stop at punctuation and CJK text', () => {
+    const bad = inlineRichText('看[这里](https://) 和 [那里](http://a.com/x)')
+    expect(bad.find((r) => r.text?.content === '这里')?.text?.link).toBeUndefined()
+    expect(bad.find((r) => r.text?.content === '那里')?.text?.link).toEqual({ url: 'http://a.com/x' })
+
+    const bare = inlineRichText('见 https://a.com/x. 然后看链接https://b.com/y然后')
+    expect(bare.filter((r) => r.text?.link).map((r) => r.text!.link!.url)).toEqual(['https://a.com/x', 'https://b.com/y'])
+    expect(bare.map((r) => r.text?.content).join('')).toBe('见 https://a.com/x. 然后看链接https://b.com/y然后')
+  })
+
   it('splits long text into 2000-char pieces', () => {
     const blocks = markdownToBlocks('字'.repeat(4500))
     const rich = (blocks[0] as any).paragraph.rich_text

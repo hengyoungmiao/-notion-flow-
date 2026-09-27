@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { z } from 'zod'
 import type { AppConfig, AppSettings, WorkspaceProfile } from './types'
-import { readJson, writeJsonAtomic } from './sync/state'
+import { readJsonOrQuarantine, writeJsonAtomic } from './sync/state'
 
 export const DEFAULT_SETTINGS: AppSettings = {
   pollMinSec: 10,
@@ -13,6 +13,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   breaker: { maxTrash: 5, maxUpdateRatio: 0.2, minUpdates: 10 },
   syncBody: true,
   syncProjects: true,
+  recurringAsSchedule: true,
+  archivedListsComplete: true,
   applyTemplate: false,
   recurringCompletionRecords: false,
   syncFocus: true,
@@ -38,6 +40,8 @@ const settingsSchema = z.object({
   }),
   syncBody: z.boolean(),
   syncProjects: z.boolean(),
+  recurringAsSchedule: z.boolean(),
+  archivedListsComplete: z.boolean(),
   applyTemplate: z.boolean(),
   recurringCompletionRecords: z.boolean(),
   syncFocus: z.boolean(),
@@ -50,15 +54,25 @@ const settingsSchema = z.object({
   defaultTimeZone: z.string().min(1)
 })
 
+/** 逐项校验：不合法的那一项用默认值，其它设置保留（旧版本或手改的配置不会让全部设置被重置） */
 export function sanitizeSettings(input: unknown): AppSettings {
-  const merged = {
-    ...DEFAULT_SETTINGS,
-    ...(typeof input === 'object' && input ? input : {}),
-    breaker: { ...DEFAULT_SETTINGS.breaker, ...((input as Partial<AppSettings>)?.breaker ?? {}) }
+  const raw = (typeof input === 'object' && input ? input : {}) as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  const shape = settingsSchema.shape
+  for (const key of Object.keys(shape) as Array<keyof typeof shape>) {
+    if (key === 'breaker') continue
+    const parsed = shape[key].safeParse(raw[key])
+    out[key] = parsed.success ? parsed.data : DEFAULT_SETTINGS[key]
   }
-  const parsed = settingsSchema.safeParse(merged)
-  if (!parsed.success) return DEFAULT_SETTINGS
-  const s = parsed.data
+  const rawBreaker = (typeof raw.breaker === 'object' && raw.breaker ? raw.breaker : {}) as Record<string, unknown>
+  const breakerShape = shape.breaker.shape
+  const breaker: Record<string, unknown> = {}
+  for (const key of Object.keys(breakerShape) as Array<keyof typeof breakerShape>) {
+    const parsed = breakerShape[key].safeParse(rawBreaker[key])
+    breaker[key] = parsed.success ? parsed.data : DEFAULT_SETTINGS.breaker[key]
+  }
+  out.breaker = breaker
+  const s = out as unknown as AppSettings
   if (s.pollMaxSec < s.pollMinSec) s.pollMaxSec = s.pollMinSec
   return s
 }
@@ -85,6 +99,8 @@ export function newWorkspace(name: string): WorkspaceProfile {
 export class ConfigStore {
   private config: AppConfig = defaultConfig()
   private listeners = new Set<(c: AppConfig) => void>()
+  /** 启动时配置文件损坏、已从备份恢复 */
+  recovered = false
 
   constructor(readonly rootDir: string) {}
 
@@ -112,8 +128,18 @@ export class ConfigStore {
     return join(this.notionHomesDir, workspaceId)
   }
 
+  get backupPath(): string {
+    return join(this.rootDir, 'config.backup.json')
+  }
+
   async load(): Promise<AppConfig> {
-    const raw = await readJson<Partial<AppConfig>>(this.path)
+    const first = await readJsonOrQuarantine<Partial<AppConfig>>(this.path)
+    let raw = first.data
+    // 配置文件损坏：改用最近一次成功保存的备份
+    if (first.corrupt) {
+      raw = (await readJsonOrQuarantine<Partial<AppConfig>>(this.backupPath)).data
+      this.recovered = true
+    }
     const base = defaultConfig()
     this.config = raw
       ? {
@@ -140,6 +166,7 @@ export class ConfigStore {
     next.settings = sanitizeSettings(next.settings)
     this.config = next
     await writeJsonAtomic(this.path, next)
+    await writeJsonAtomic(this.backupPath, next).catch(() => undefined)
     const snapshot = this.get()
     for (const l of this.listeners) l(snapshot)
     return snapshot

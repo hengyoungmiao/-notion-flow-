@@ -12,6 +12,7 @@ function result(writes: number): RoundResult {
     applied: true,
     blocked: null,
     writes,
+    appliedCounts: { creates: writes, updates: 0, corrections: 0, destructive: 0, links: 0, unlinks: 0 },
     reconciled: false,
     backupPath: null,
     durationMs: 1
@@ -57,6 +58,53 @@ describe('Scheduler', () => {
     const none = new Scheduler({ engine: () => null, workspaceId: () => null, settings: () => DEFAULT_SETTINGS })
     await none.syncNow()
     expect(none.snapshot().status).toBe('needs_setup')
+  })
+
+  it('keeps paused status when paused during a running round', async () => {
+    let release!: () => void
+    const engine = fakeEngine(() => new Promise<RoundResult>((r) => (release = () => r(result(0)))))
+    const s = new Scheduler({ engine: () => engine, workspaceId: () => 'w', settings: () => DEFAULT_SETTINGS })
+    s.start()
+    await vi.waitFor(() => expect(engine.runRound).toHaveBeenCalledTimes(1))
+    s.pause()
+    release()
+    await s.waitIdle()
+    expect(s.snapshot().status).toBe('paused')
+    expect(s.snapshot().nextRunAt).toBeNull()
+    s.stop()
+  })
+
+  it('never runs two rounds at the same time', async () => {
+    let active = 0
+    let maxActive = 0
+    const releases: Array<() => void> = []
+    const engine = fakeEngine(async () => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await new Promise<void>((r) => releases.push(r))
+      active--
+      return result(0)
+    })
+    const s = new Scheduler({ engine: () => engine, workspaceId: () => 'w', settings: () => DEFAULT_SETTINGS })
+    s.start()
+    await vi.waitFor(() => expect(engine.runRound).toHaveBeenCalledTimes(1))
+    s.pause()
+    s.resume()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(engine.runRound).toHaveBeenCalledTimes(1)
+    releases.shift()!()
+    await vi.waitFor(() => expect(engine.runRound).toHaveBeenCalledTimes(2))
+    s.stop()
+    releases.shift()!()
+    await s.waitIdle()
+    expect(maxActive).toBe(1)
+  })
+
+  it('counts only applied operations in today stats', async () => {
+    const engine = fakeEngine(async () => ({ ...result(0), summary: { ...result(0).summary, counts: { ...result(0).summary.counts, updates: 30 } } }))
+    const s = new Scheduler({ engine: () => engine, workspaceId: () => 'w', settings: () => DEFAULT_SETTINGS })
+    await s.syncNow()
+    expect(s.snapshot().today.updated).toBe(0)
   })
 
   it('backs off exponentially on network errors', async () => {

@@ -217,3 +217,85 @@ describe('重复任务', () => {
     expect(syncSection(w, page.id)).toEqual(['🔁 每周一 · 按截止日期重复', '✅ 最近完成：09-27（共 1 次）'])
   })
 })
+
+describe('重复任务按日程处理', () => {
+  const T = FLOW_IDS.type
+  const weekly = { repeatFlag: 'RRULE:FREQ=WEEKLY;BYDAY=MO', isAllDay: true, dueDate: '2026-09-27T16:00:00.000+0000', timeZone: 'Asia/Shanghai' }
+  const typeOf = (w: World, id: string) => prop(pageByDidaId(w, id)!, '任务类型')?.select?.id
+
+  it('重复任务新建为「日程」，普通全天任务仍为「待办」', async () => {
+    const w = await makeWorld({
+      seed: (w) => {
+        w.dida.addTask({ id: 'r1', projectId: 'p-dev', title: '周会', ...weekly })
+        w.dida.addTask({ id: 'n1', projectId: 'p-dev', title: '交报告', isAllDay: true, dueDate: '2026-09-27T16:00:00.000+0000' })
+      }
+    })
+    await w.engine().runRound({ initial: true })
+    expect(typeOf(w, 'r1')).toBe(T.schedule)
+    expect(typeOf(w, 'n1')).toBe(T.todo)
+  })
+
+  it('旧页面补写「日程」，在 Notion 改掉后校正时改回；批量补写不触发熔断', async () => {
+    const w = await makeWorld({
+      settings: { recurringAsSchedule: false },
+      seed: (w) => {
+        for (let i = 0; i < 15; i++) w.dida.addTask({ id: `r${i}`, projectId: 'p-dev', title: `重复${i}`, ...weekly })
+      }
+    })
+    await w.engine().runRound({ initial: true })
+    expect(typeOf(w, 'r0')).toBe(T.todo)
+
+    w.settings = { ...w.settings, recurringAsSchedule: true }
+    advance(w, 1)
+    const res = await w.engine().runRound()
+    expect(res.blocked).toBeNull()
+    expect(taskPages(w).every((p) => prop(p, '任务类型')?.select?.id === T.schedule)).toBe(true)
+
+    const page = pageByDidaId(w, 'r0')!
+    await w.notion.updatePage(page.id, { properties: { p_type: { select: { id: T.todo } } } })
+    advance(w, 11)
+    await w.engine().runRound()
+    expect(typeOf(w, 'r0')).toBe(T.schedule)
+  })
+
+  it('重复任务不按标签关联项目：旧的同步关联移除、手动关联保留，子任务不继承', async () => {
+    let site!: { id: string }
+    const w = await makeWorld({
+      settings: { recurringAsSchedule: false },
+      seed: (w) => {
+        site = w.notion.seedPage(FLOW_IDS.projects, { title: { title: [{ text: { content: '网站改版' } }] } })
+        w.dida.addTask({ id: 'r1', projectId: 'p-dev', title: '周报', tags: ['网站改版'], ...weekly })
+        w.dida.addTask({ id: 'c1', projectId: 'p-dev', title: '整理数据', parentId: 'r1' })
+        w.dida.addTask({ id: 'n1', projectId: 'p-dev', title: '首页设计', tags: ['网站改版'] })
+      }
+    })
+    await w.engine().runRound({ initial: true })
+    expect(prop(pageByDidaId(w, 'r1')!, '关联项目')?.relation).toEqual([{ id: site.id }])
+    expect(prop(pageByDidaId(w, 'c1')!, '关联项目')?.relation).toEqual([{ id: site.id }])
+
+    const r1 = pageByDidaId(w, 'r1')!
+    await w.notion.updatePage(r1.id, { properties: { p_project: { relation: [{ id: site.id }, { id: 'manual-project' }] } } })
+    w.settings = { ...w.settings, recurringAsSchedule: true }
+    advance(w, 1)
+    w.dida.updateTask('r1', { title: '周报（新）' })
+    w.dida.updateTask('c1', { title: '整理数据（新）' })
+    await w.engine().runRound()
+    expect(prop(pageByDidaId(w, 'r1')!, '关联项目')?.relation).toEqual([{ id: 'manual-project' }])
+    expect(prop(pageByDidaId(w, 'c1')!, '关联项目')?.relation).toEqual([])
+    expect(prop(pageByDidaId(w, 'n1')!, '关联项目')?.relation).toEqual([{ id: site.id }])
+  })
+
+  it('关闭开关后：重复任务按时间规则设置类型，并按标签关联项目', async () => {
+    let site!: { id: string }
+    const w = await makeWorld({
+      settings: { recurringAsSchedule: false },
+      seed: (w) => {
+        site = w.notion.seedPage(FLOW_IDS.projects, { title: { title: [{ text: { content: '网站改版' } }] } })
+        w.dida.addTask({ id: 'r1', projectId: 'p-dev', title: '周报', tags: ['网站改版'], ...weekly })
+      }
+    })
+    await w.engine().runRound({ initial: true })
+    expect(typeOf(w, 'r1')).toBe(T.todo)
+    expect(prop(pageByDidaId(w, 'r1')!, '关联项目')?.relation).toEqual([{ id: site.id }])
+  })
+})

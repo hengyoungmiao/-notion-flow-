@@ -27,6 +27,8 @@ export class FakeDida implements DidaReader {
   calls: string[] = []
   failWith: CliError | null = null
   inboxInFilter = true
+  /** 模拟接口对不存在的清单报错（而不是 404） */
+  failGetForUnknownProject = false
 
   private check(name: string): void {
     this.calls.push(name)
@@ -83,6 +85,7 @@ export class FakeDida implements DidaReader {
   }
   async listCompletedTasks(from: Date, to: Date): Promise<DidaTask[]> {
     this.check('completed')
+    if (to.getTime() - from.getTime() > 30 * 86_400_000) throw new CliError('DIDA API 错误 400: range > 30 days', 'dida', 'validation', 400)
     return [...this.tasks.values()]
       .filter((t) => t.status === 2 && t.completedTime)
       .filter((t) => {
@@ -93,6 +96,8 @@ export class FakeDida implements DidaReader {
   }
   async getTask(projectId: string, taskId: string): Promise<DidaTask | null> {
     this.check('get')
+    if (this.failGetForUnknownProject && !projectId.startsWith('inbox') && !this.projects.some((p) => p.id === projectId))
+      throw new CliError('DIDA API 错误 400: project not found', 'dida', 'validation', 400)
     const t = this.tasks.get(taskId)
     return t && t.projectId === projectId ? structuredClone(t) : null
   }
@@ -149,6 +154,10 @@ export class FakeNotion implements NotionClient {
   calls: string[] = []
   writes = 0
   failWith: CliError | null = null
+  /** 测试用：下一次追加子块失败 */
+  failNextAppend: CliError | null = null
+  /** 测试用：下一次删除块失败 */
+  failNextDelete: CliError | null = null
   workspaceName = '演示工作空间'
   private clock = Date.parse('2026-09-01T00:00:00Z')
 
@@ -340,7 +349,14 @@ export class FakeNotion implements NotionClient {
 
   async appendBlocks(parentId: string, children: unknown[], position?: { type: string; after_block?: { id: string } }) {
     this.check('appendBlocks')
+    if (this.failNextAppend) {
+      const e = this.failNextAppend
+      this.failNextAppend = null
+      throw e
+    }
     if (children.length > 100) throw new CliError('validation: children > 100', 'ntn', 'validation', 400)
+    if (this.findPage(parentId)?.page.in_trash)
+      throw new CliError("Can't edit block that is archived. You must unarchive the block before editing.", 'ntn', 'validation', 400)
     this.writes++
     const list = this.blocks.get(parentId) ?? []
     const created = children.map((c) => this.toBlock(c))
@@ -355,6 +371,11 @@ export class FakeNotion implements NotionClient {
 
   async deleteBlock(id: string): Promise<void> {
     this.check('deleteBlock')
+    if (this.failNextDelete) {
+      const e = this.failNextDelete
+      this.failNextDelete = null
+      throw e
+    }
     this.writes++
     for (const [parent, list] of this.blocks) {
       const i = list.findIndex((b) => b.id === id)
@@ -380,6 +401,8 @@ export class FakeNotion implements NotionClient {
     this.writes++
     const found = this.findPage(id)
     if (!found) throw new CliError('Could not find page', 'ntn', 'not_found', 404)
+    if (found.page.in_trash && body.properties && body.in_trash === undefined)
+      throw new CliError("Can't edit block that is archived. You must unarchive the block before editing.", 'ntn', 'validation', 400)
     if (body.in_trash !== undefined) found.page.in_trash = !!body.in_trash
     if (body.properties) this.applyProps(found.src, found.page, body.properties)
     found.page.last_edited_time = this.tick()

@@ -9,6 +9,7 @@ export interface DiagnosticsReport {
   generatedAt: string
   preferenceTimeZone: string | null
   projectCount: number
+  closedProjectCount: number
   groupCount: number
   openTaskCount: number
   inboxInFilter: boolean
@@ -98,6 +99,8 @@ export async function collectDiagnostics(dida: DidaReader, now = new Date()): Pr
     generatedAt: now.toISOString(),
     preferenceTimeZone: typeof pref.timeZone === 'string' ? pref.timeZone : null,
     projectCount: projects.length,
+    /** 用于确认 project list 是否返回已归档清单（closed: true） */
+    closedProjectCount: projects.filter((p) => p.closed).length,
     groupCount: groups.length,
     openTaskCount: open.length,
     inboxInFilter: open.some((t) => t.projectId.startsWith('inbox')),

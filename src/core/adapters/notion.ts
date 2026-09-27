@@ -54,6 +54,14 @@ export async function queryAll(
   return pages
 }
 
+/** 超时/网络错误后能否安全重试：新建页面、追加子块不幂等（查询类 POST 是幂等的） */
+export function isIdempotent(method: HttpMethod, path: string): boolean {
+  const p = path.replace(/^\//, '').split('?')[0]!
+  if (method === 'POST' && p === 'v1/pages') return false
+  if (method === 'PATCH' && /^v1\/blocks\/[^/]+\/children$/.test(p)) return false
+  return true
+}
+
 export function ntnEnv(cmd: Pick<NtnCommand, 'notionHome' | 'token' | 'env'>): Record<string, string> {
   const env: Record<string, string> = {
     NOTION_HOME: cmd.notionHome,
@@ -93,7 +101,7 @@ export class NtnNotionClient implements NotionClient {
       } catch {
         throw new CliError(`无法解析 Notion 输出：${text.slice(0, 120)}`, 'ntn', 'unknown')
       }
-    })
+    }, 4, 1000, !isIdempotent(method, path))
   }
 
   async whoami(): Promise<{ name: string | null; workspaceName: string | null }> {

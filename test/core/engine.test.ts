@@ -289,6 +289,22 @@ describe('deletions and safety', () => {
     expect((await w.store.load(w.profile.id)).pendingApproval).toBeNull()
   })
 
+  it('keeps one pending approval across blocked rounds and only counts applied ops', async () => {
+    const w = await initialized(seedMany(8))
+    for (let i = 0; i < 6; i++) w.dida.deleteTask(`t${i}`)
+    w.dida.addTask({ id: 'n1', projectId: 'p-dev', title: '新任务' })
+    const e = w.engine()
+    const first = await e.runRound()
+    expect(first.summary.counts.destructive).toBe(6)
+    expect(first.appliedCounts.destructive).toBe(0)
+    expect(first.appliedCounts.creates).toBe(1)
+
+    advance(w, 1)
+    const second = await e.runRound()
+    expect(second.blocked?.createdAt).toBe(first.blocked?.createdAt)
+    expect(second.appliedCounts.destructive).toBe(0)
+  })
+
   it('corrects Notion edits to owned fields during reconciliation', async () => {
     const w = await initialized((w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '正确标题' }))
     const page = pageByDidaId(w, 't1')!

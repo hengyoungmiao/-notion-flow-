@@ -59,8 +59,10 @@ export function SetupFlow({ state, mode = 'first-run', workspaceId, onFinished }
     else message.error(res.error ?? '生成预览失败')
   }
 
+  // 每次进入预览都重新生成（回到上一步改了映射或范围后，预览不会是旧的）
   useEffect(() => {
-    if (current === 'preview' && !preview) void makePreview()
+    if (current === 'preview') void makePreview()
+    else setPreview(null)
   }, [current])
 
   const start = async () => {
@@ -129,9 +131,9 @@ export function SetupFlow({ state, mode = 'first-run', workspaceId, onFinished }
           <ul>
             <li>滴答清单 → 二级领域，滴答文件夹 → 一级领域，任务自动绑定领域；</li>
             <li>
-              同步只维护这些字段：任务、状态（未完成/完成/放弃）、排期、完成日期、下一步做什么？、二级领域、滴答ID；
+              同步只维护这些内容：任务、状态（未完成/完成/放弃）、排期、完成日期、二级领域、按标签关联的项目、滴答ID，以及页面最上方的「滴答同步区」（描述、检查事项、子任务、重复规则）；
             </li>
-            <li>关联项目、笔记、前置任务、页面正文等其它内容永远不会被改动；</li>
+            <li>「下一步做什么？」、手动加的关联项目、笔记、前置任务、同步区以外的正文等其它内容永远不会被改动；</li>
             <li>FlowSync 对滴答<b>只读</b>，不会修改或删除滴答里的任何数据。</li>
           </ul>
           <Descriptions size="small" column={1} bordered title="内置工具">

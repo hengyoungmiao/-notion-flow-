@@ -241,6 +241,10 @@ export interface AppSettings {
   syncBody: boolean
   /** 滴答标签 #项目名 自动关联 FLO.W 同名项目 */
   syncProjects: boolean
+  /** 重复任务：「任务类型」固定为「日程」，且不按标签关联项目 */
+  recurringAsSchedule: boolean
+  /** 滴答清单归档后，其中未完成的任务在 Notion 标记完成（完成日期为检测到归档的那天） */
+  archivedListsComplete: boolean
   applyTemplate: boolean
   recurringCompletionRecords: boolean
   /** 同步滴答的番茄钟/正计时记录到 FLO.W 任务番茄数据库 */
@@ -275,6 +279,8 @@ export interface WrittenTask {
   domainPageId: string | null
   /** 同步写入过的项目（手动关联的项目不在这里） */
   projectPageIds?: string[]
+  /** 同步维护的「任务类型」（只有重复任务会维护） */
+  taskType?: 'schedule' | null
 }
 
 export interface TaskLink {
@@ -340,6 +346,15 @@ export interface WorkspaceState {
     cursor: string | null
     links: Record<string, FocusLink>
   }
+  /** 滴答清单的归档/删除记录（检测日期用于“清单已归档，任务标记完成”的完成日期） */
+  lists: ListLifecycle
+}
+
+export interface ListLifecycle {
+  /** 已归档（closed）的清单：date 为检测到归档那天的本地日期 YYYY-MM-DD */
+  archived: Record<string, { name: string; date: string; at: string }>
+  /** 已在滴答删除的清单（映射页显示 30 天） */
+  deleted: Record<string, { name: string; at: string }>
 }
 
 // ───────────────────────── 规范化值 ─────────────────────────
@@ -367,4 +382,6 @@ export interface DesiredTask {
   projectPageIds: string[] | null
   parentDidaId: string | null
   taskTypeOnCreate: 'schedule' | 'todo'
+  /** 需要持续维护的「任务类型」；null 表示只在新建时设置 */
+  taskType: 'schedule' | null
 }

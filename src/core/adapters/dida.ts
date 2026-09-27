@@ -35,6 +35,16 @@ export async function listFocusRange(dida: DidaReader, from: Date, to: Date, typ
   return [...out.values()]
 }
 
+/** 按不超过 29 天的窗口分段读取已完成任务（长时间未运行后避免超出接口范围） */
+export async function listCompletedRange(dida: DidaReader, from: Date, to: Date): Promise<DidaTask[]> {
+  const out = new Map<string, DidaTask>()
+  for (let start = from.getTime(); start < to.getTime(); start += 29 * DAY) {
+    const end = Math.min(to.getTime(), start + 29 * DAY)
+    for (const t of await dida.listCompletedTasks(new Date(start), new Date(end))) out.set(t.id, t)
+  }
+  return [...out.values()]
+}
+
 export interface DidaCommand {
   /** 可执行文件（打包后为 Electron 自身，配合 ELECTRON_RUN_AS_NODE=1） */
   command: string
@@ -64,7 +74,8 @@ export class DidaCliReader implements DidaReader {
         throw new CliError(summarizeStderr(res.stderr || res.stdout), 'dida', kind, status, res.stderr)
       }
       const text = res.stdout.trim()
-      if (!text) return undefined as T
+      // 接口返回空内容或非 JSON 时，dida-cli 会打印 `undefined`
+      if (!text || text === 'undefined' || text === 'null') return undefined as T
       try {
         return JSON.parse(text) as T
       } catch {

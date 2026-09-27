@@ -47,7 +47,6 @@ export function bindTaskSchema(ds: NotionDataSource): TaskBinding {
   if (!status) issues.push({ level: 'error', message: '任务库缺少「状态」字段（status 类型）' })
   if (!schedule) issues.push({ level: 'error', message: '任务库缺少「排期」字段（date 类型）' })
   if (!completedAt) issues.push({ level: 'warning', message: '未找到「完成日期」字段，将不同步完成日期' })
-  if (!note) issues.push({ level: 'warning', message: '未找到「下一步做什么？」字段，将不同步任务描述' })
   if (!domain) issues.push({ level: 'warning', message: '未找到「二级领域」关系字段，将不绑定领域' })
 
   const statusBinding = status ? bindStatus(status) : null
@@ -83,6 +82,53 @@ export function bindTaskSchema(ds: NotionDataSource): TaskBinding {
     projectsDataSourceId: project?.relation?.data_source_id ?? null,
     issues
   }
+}
+
+export interface SchemaRefresh {
+  schema: FlowSchema
+  /** 需要提示用户的问题（可选字段被删除等） */
+  issues: string[]
+  /** 无法继续同步的问题（必需字段被删除） */
+  fatal: string | null
+  changed: boolean
+}
+
+const REQUIRED_PROPS = { title: '标题', status: '状态', schedule: '排期', didaId: '滴答ID' } as const
+const OPTIONAL_PROPS = { completedAt: '完成日期', domain: '二级领域', taskType: '任务类型', project: '关联项目', note: '下一步做什么？' } as const
+
+/**
+ * 按属性 ID 重新核对任务库（字段改名不影响）：
+ * 重新读取「状态」选项和分组（用户新增的状态不会被当成未知值改回），
+ * 可选字段被删除时停止写入，必需字段被删除时给出明确错误；之前没绑定上的可选字段按名称补上。
+ */
+export function refreshTaskSchema(current: FlowSchema, ds: NotionDataSource): SchemaRefresh {
+  const byId = new Map(props(ds).map((p) => [p.id, p]))
+  const bound = bindTaskSchema(ds)
+  const p = current.tasks.props
+  for (const [key, name] of Object.entries(REQUIRED_PROPS) as Array<[keyof typeof REQUIRED_PROPS, string]>) {
+    if (!p[key] || !byId.has(p[key]))
+      return { schema: current, issues: [], fatal: `任务库的「${name}」字段已被删除或更改，请在 Notion 中恢复，或到「工作空间」重新识别任务库`, changed: false }
+  }
+  const issues: string[] = []
+  const next = { ...p }
+  for (const [key, name] of Object.entries(OPTIONAL_PROPS) as Array<[keyof typeof OPTIONAL_PROPS, string]>) {
+    const id = p[key] ?? null
+    if (id && byId.has(id)) continue
+    next[key] = bound.tasks.props[key] ?? null
+    if (id && !next[key] && key !== 'note') issues.push(`任务库的「${name}」字段已被删除，暂停同步这个字段`)
+  }
+  const status = bindStatus(byId.get(p.status)!)
+  if (!status) return { schema: current, issues: [], fatal: '任务库「状态」字段缺少可用的完成/未完成选项', changed: false }
+  const taskTypeOptions = { schedule: null as string | null, todo: null as string | null }
+  for (const o of (next.taskType ? byId.get(next.taskType)?.select?.options : undefined) ?? []) {
+    if (o.name === '日程') taskTypeOptions.schedule = o.id
+    if (o.name === '待办') taskTypeOptions.todo = o.id
+  }
+  const schema: FlowSchema = {
+    ...current,
+    tasks: { ...current.tasks, props: next, statusOptions: status.options, statusGroups: status.groups, taskTypeOptions }
+  }
+  return { schema, issues, fatal: null, changed: JSON.stringify(schema.tasks) !== JSON.stringify(current.tasks) }
 }
 
 /** FLO.W「我的项目 DB」：只需要标题字段（用于按标签匹配项目名） */

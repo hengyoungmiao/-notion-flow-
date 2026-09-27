@@ -128,8 +128,12 @@ if (!app.requestSingleInstanceLock()) {
     const shouldHide = startHidden && controller.config.get().onboarded
     if (!shouldHide) createWindow()
 
-    powerMonitor.on('resume', () => void controller?.scheduler.syncNow())
-    powerMonitor.on('unlock-screen', () => void controller?.scheduler.syncNow())
+    // 睡眠唤醒/解锁后立即同步一次（用户暂停时不打扰）
+    const wake = () => {
+      if (controller && !controller.scheduler.isPaused) void controller.scheduler.syncNow()
+    }
+    powerMonitor.on('resume', wake)
+    powerMonitor.on('unlock-screen', wake)
   })
 
   app.on('activate', () => showWindow())

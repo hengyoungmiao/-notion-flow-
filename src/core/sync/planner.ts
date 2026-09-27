@@ -8,6 +8,7 @@ import {
   diffAgainstActual,
   diffAgainstWritten,
   isEmptyPatch,
+  isRecurring,
   patchFields,
   type ActualTask,
   taskDescription,
@@ -27,13 +28,15 @@ export type TaskOp =
       pageId: string
       desired: DesiredTask
       patch: TaskPatch
-      reason: 'dida' | 'drift' | 'relink' | 'match'
+      /** archived：清单已归档，任务标记完成 */
+      reason: 'dida' | 'drift' | 'relink' | 'match' | 'archived'
       actual?: ActualTask
     }
   | { kind: 'link'; didaId: string; pageId: string; desired: DesiredTask; reason: 'relink' | 'match' | 'refresh' }
-  | { kind: 'trash'; didaId: string; pageId: string; title: string }
-  | { kind: 'abandon'; didaId: string; pageId: string; title: string; desired: DesiredTask | null }
-  | { kind: 'unlink'; didaId: string; pageId: string; title: string; reason: 'out_of_scope' | 'deleted' }
+  /** listDeleted：整个清单在滴答被删除 */
+  | { kind: 'trash'; didaId: string; pageId: string; title: string; listDeleted?: boolean }
+  | { kind: 'abandon'; didaId: string; pageId: string; title: string; desired: DesiredTask | null; listDeleted?: boolean }
+  | { kind: 'unlink'; didaId: string; pageId: string; title: string; reason: 'out_of_scope' | 'deleted' | 'archived' | 'list_deleted' }
   | { kind: 'removed'; didaId: string; pageId: string; title: string }
   | { kind: 'touch'; didaId: string; projectId: string; etag?: string }
   /** 页面顶部同步区：spec 为 null 表示删除同步区；pageId 为 null 表示本轮新建的页面 */
@@ -58,6 +61,8 @@ export interface PlanInput {
   candidates: ActualTask[] | null
   /** FLO.W 项目（用于按标签匹配） */
   projects?: Array<{ pageId: string; title: string }>
+  /** 已归档的清单（→ 检测日期）与已删除的清单 */
+  lists?: { archived: Map<string, string>; deleted: Set<string> }
   initial: boolean
   now: Date
 }
@@ -105,6 +110,34 @@ function dayOfRaw(value: { start: string } | null | undefined): string | null {
   return value?.start ? value.start.slice(0, 10) : null
 }
 
+/** 清单归档：未完成的任务改为完成，完成日期为检测到归档的那天 */
+function markArchived(desired: DesiredTask, date: string): DesiredTask {
+  if (desired.statusGroup !== 'open') return desired
+  const value = { start: date, end: null }
+  return { ...desired, statusGroup: 'done', completedAt: value, completedValue: value }
+}
+
+/** 由上次写入值构造期望值（归档清单里的任务本轮读不到，其它字段保持原样） */
+function desiredFromWritten(link: TaskLink): DesiredTask {
+  const w = link.written
+  return {
+    didaId: link.didaId,
+    projectId: link.projectId,
+    title: w.title,
+    statusGroup: w.statusGroup,
+    schedule: w.schedule,
+    scheduleValue: w.schedule ? { start: w.schedule.start, end: w.schedule.end } : null,
+    completedAt: w.completedAt,
+    completedValue: w.completedAt ? { start: w.completedAt.start, end: w.completedAt.end } : null,
+    note: null,
+    domainPageId: w.domainPageId,
+    projectPageIds: w.projectPageIds ?? [],
+    parentDidaId: link.parentDidaId ?? null,
+    taskTypeOnCreate: 'todo',
+    taskType: w.taskType ?? null
+  }
+}
+
 export function planTasks(input: PlanInput): PlanResult {
   const { state, domainPlan, schema, settings } = input
   const ops: TaskOp[] = []
@@ -126,15 +159,21 @@ export function planTasks(input: PlanInput): PlanResult {
   const tagProjects = (tags: string[] | undefined): string[] => [
     ...new Set((tags ?? []).map((t) => projectIndex.get(projectKey(t))).filter((id): id is string => !!id))
   ]
+  // 重复任务不按标签关联项目（设置开启时）
+  const skipProjects = (task: DidaTask) => settings.recurringAsSchedule && isRecurring(task)
   const projectsFor = (task: DidaTask): string[] | null => {
     if (!settings.syncProjects || !schema.projects) return null
+    if (skipProjects(task)) return []
     const own = tagProjects(task.tags)
     if (own.length || !task.parentId) return own
     // 子任务没有匹配到项目时继承父任务的项目
     const parent = taskById.get(task.parentId)
-    if (parent) return tagProjects(parent.tags)
+    if (parent) return skipProjects(parent) ? [] : tagProjects(parent.tags)
     return state.tasks[task.parentId]?.written.projectPageIds ?? []
   }
+
+  const archivedDate = (projectId: string) => input.lists?.archived.get(projectId)
+  const listDeleted = (projectId: string) => !!input.lists?.deleted.has(projectId)
 
   const ctxFor = (link: TaskLink | undefined): MapContext => ({
     schema,
@@ -142,6 +181,8 @@ export function planTasks(input: PlanInput): PlanResult {
     userTimeZone: input.userTimeZone,
     domainFor: (projectId) => {
       if (isInbox(projectId)) return null
+      // 归档清单：保持原来的二级领域
+      if (archivedDate(projectId)) return link?.written.domainPageId ?? null
       const d = domainPlan.listMap.get(projectId)
       if (d === KEEP) return link?.written.domainPageId ?? null
       return d ?? null
@@ -187,8 +228,50 @@ export function planTasks(input: PlanInput): PlanResult {
     )
   }
 
+  /** 归档清单里本轮读到的任务：有链接的按实际状态同步（未完成的改为完成），没链接的不新建页面 */
+  const handleArchivedTask = (task: DidaTask, date: string): void => {
+    const link = state.tasks[task.id]
+    if (!link || state.notionRemoved[task.id]) return
+    if (!settings.archivedListsComplete) {
+      ops.push({ kind: 'unlink', didaId: task.id, pageId: link.pageId, title: task.title ?? '', reason: 'archived' })
+      return
+    }
+    processed.push(task)
+    const actual = desiredFromDida(task, ctxFor(link))
+    const desired = markArchived(actual, date)
+    const patch = diffAgainstWritten(desired, link.written)
+    if (!isEmptyPatch(patch)) {
+      const reason = actual.statusGroup === 'open' && patch.status ? 'archived' : 'dida'
+      ops.push({ kind: 'update', didaId: task.id, pageId: link.pageId, desired, patch, reason })
+    } else if (link.projectId !== task.projectId || link.etag !== task.etag)
+      ops.push({ kind: 'touch', didaId: task.id, projectId: task.projectId, etag: task.etag })
+  }
+
+  /** 归档清单里本轮没读到的链接任务：直接按上次写入值标记完成（不调用滴答接口） */
+  const handleArchivedLink = (link: TaskLink, date: string): void => {
+    if (!settings.archivedListsComplete) {
+      ops.push({ kind: 'unlink', didaId: link.didaId, pageId: link.pageId, title: link.written.title, reason: 'archived' })
+      return
+    }
+    if (link.written.statusGroup !== 'open') return
+    const desired = markArchived(desiredFromWritten(link), date)
+    const patch = diffAgainstWritten(desired, link.written)
+    if (!isEmptyPatch(patch)) ops.push({ kind: 'update', didaId: link.didaId, pageId: link.pageId, desired, patch, reason: 'archived' })
+  }
+
+  /** 按「删除任务」设置处理滴答里已删除的任务 */
+  const deleteLinked = (link: TaskLink, byList: boolean): void => {
+    const title = link.written.title
+    const base = { didaId: link.didaId, pageId: link.pageId, title }
+    if (settings.deletePolicy === 'trash') ops.push({ kind: 'trash', ...base, listDeleted: byList })
+    else if (settings.deletePolicy === 'abandon') ops.push({ kind: 'abandon', ...base, desired: null, listDeleted: byList })
+    else ops.push({ kind: 'unlink', ...base, reason: byList ? 'list_deleted' : 'deleted' })
+  }
+
   const handleTask = (task: DidaTask): void => {
     handled.add(task.id)
+    const archived = archivedDate(task.projectId)
+    if (archived) return handleArchivedTask(task, archived)
     const link = state.tasks[task.id]
     if (!inScope(task)) {
       if (link) ops.push({ kind: 'unlink', didaId: task.id, pageId: link.pageId, title: task.title ?? '', reason: 'out_of_scope' })
@@ -284,20 +367,38 @@ export function planTasks(input: PlanInput): PlanResult {
   // 本轮缺席的链接任务
   for (const link of Object.values(state.tasks)) {
     if (handled.has(link.didaId)) continue
+    const archived = archivedDate(link.projectId)
+    if (archived) {
+      handleArchivedLink(link, archived)
+      continue
+    }
+    // 整个清单在滴答被删除：不再逐条向滴答确认，直接按删除设置处理
+    if (listDeleted(link.projectId)) {
+      deleteLinked(link, true)
+      continue
+    }
     if (!input.confirmations.has(link.didaId)) continue
     const confirmed = input.confirmations.get(link.didaId)
     if (confirmed) {
       handleTask(confirmed)
       continue
     }
-    const title = link.written.title
-    if (settings.deletePolicy === 'trash') ops.push({ kind: 'trash', didaId: link.didaId, pageId: link.pageId, title })
-    else if (settings.deletePolicy === 'abandon') ops.push({ kind: 'abandon', didaId: link.didaId, pageId: link.pageId, title, desired: null })
-    else ops.push({ kind: 'unlink', didaId: link.didaId, pageId: link.pageId, title, reason: 'deleted' })
+    deleteLinked(link, false)
   }
 
   if (settings.syncBody) ops.push(...planBodies())
+  else ops.push(...clearBodies())
   return { ops, warnings: [...new Set(warnings)] }
+
+  /** 关闭同步区开关后：清掉页面上已有的同步区（避免内容过时） */
+  function clearBodies(): TaskOp[] {
+    const dropped = new Set(
+      ops.filter((o) => o.kind === 'unlink' || o.kind === 'removed' || o.kind === 'trash' || o.kind === 'abandon').map((o) => o.didaId)
+    )
+    return Object.values(state.tasks)
+      .filter((l) => !!l.body?.blockId && !dropped.has(l.didaId))
+      .map((l) => ({ kind: 'body' as const, didaId: l.didaId, pageId: l.pageId, title: l.written.title, spec: null }))
+  }
 
   /** 页面顶部“滴答同步区”：重复规则、完成记录、父任务、描述、检查事项、子任务 */
   function planBodies(): TaskOp[] {
@@ -376,7 +477,7 @@ export function countOps(ops: TaskOp[]): PlanCounts {
     if (op.kind === 'create') c.creates++
     else if (op.kind === 'update') {
       if (op.reason === 'drift') c.corrections++
-      else if (op.reason === 'dida') c.updates++
+      else if (op.reason === 'dida' || op.reason === 'archived') c.updates++
       else c.links++
     } else if (op.kind === 'trash' || op.kind === 'abandon') c.destructive++
     else if (op.kind === 'link') c.links++
@@ -390,6 +491,7 @@ export function describeOp(op: TaskOp): string {
     case 'create':
       return `新建「${op.desired.title}」`
     case 'update':
+      if (op.reason === 'archived') return `清单已归档，任务标记完成「${op.desired.title}」`
       return `更新「${op.desired.title}」：${patchFields(op.patch).join('、')}`
     case 'link':
       return `关联「${op.desired.title}」`

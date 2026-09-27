@@ -10,13 +10,18 @@ export interface BreakerVerdict {
  * 批量变更熔断：一轮计划移入回收站/标记放弃过多，或修改比例过高时暂停，等待用户在界面确认。
  * 新建、关联不受限制（不会破坏已有数据）。
  */
+/** 低风险的更新：只改「任务类型」（例如升级后给重复任务补写「日程」），不计入熔断 */
+export function isLowRiskUpdate(op: TaskOp): boolean {
+  return op.kind === 'update' && Object.keys(op.patch).length > 0 && Object.keys(op.patch).every((k) => k === 'taskType')
+}
+
 export function evaluateBreaker(
   ops: TaskOp[],
   linkedCount: number,
   breaker: AppSettings['breaker'],
   now: Date
 ): BreakerVerdict {
-  const counts = countOps(ops)
+  const counts = countOps(ops.filter((o) => !isLowRiskUpdate(o)))
   const updates = counts.updates + counts.corrections
   const updateLimit = Math.max(breaker.minUpdates, Math.ceil(linkedCount * breaker.maxUpdateRatio))
   const reasons: string[] = []
@@ -24,7 +29,12 @@ export function evaluateBreaker(
   if (updates > updateLimit) reasons.push(`计划修改 ${updates} 个 Notion 任务（上限 ${updateLimit}）`)
   if (reasons.length === 0) return { blocked: false, pending: null }
   const sample = ops
-    .filter((o) => o.kind === 'trash' || o.kind === 'abandon' || (o.kind === 'update' && (o.reason === 'dida' || o.reason === 'drift')))
+    .filter(
+      (o) =>
+        o.kind === 'trash' ||
+        o.kind === 'abandon' ||
+        (o.kind === 'update' && !isLowRiskUpdate(o) && (o.reason === 'dida' || o.reason === 'drift' || o.reason === 'archived'))
+    )
     .slice(0, 20)
     .map(describeOp)
   return {
@@ -43,6 +53,7 @@ export function safeSubset(ops: TaskOp[]): TaskOp[] {
       o.kind === 'unlink' ||
       o.kind === 'removed' ||
       o.kind === 'body' ||
+      isLowRiskUpdate(o) ||
       (o.kind === 'update' && (o.reason === 'relink' || o.reason === 'match'))
   )
 }

@@ -15,13 +15,18 @@ import { normalizeNote, plainText, toRichText } from './text'
 
 export interface MapContext {
   schema: FlowSchema
-  settings: Pick<AppSettings, 'defaultTimeZone' | 'allDayEndExclusive'>
+  settings: Pick<AppSettings, 'defaultTimeZone' | 'allDayEndExclusive'> & Partial<Pick<AppSettings, 'recurringAsSchedule'>>
   /** 滴答偏好设置里的时区（优先于默认时区） */
   userTimeZone?: string | null
   /** 清单 → 二级领域页（或 `pending:<projectId>`），收件箱/未映射返回 null */
   domainFor(projectId: string): string | null
   /** 任务 → 由标签匹配到的项目页；返回 null 表示不管理「关联项目」 */
   projectsFor?(task: DidaTask): string[] | null
+}
+
+/** 滴答重复任务（带重复规则） */
+export function isRecurring(task: Pick<DidaTask, 'repeatFlag'>): boolean {
+  return !!task.repeatFlag?.trim()
 }
 
 export function statusGroupOf(task: DidaTask): StatusGroup {
@@ -39,6 +44,11 @@ export function desiredFromDida(task: DidaTask, ctx: MapContext): DesiredTask {
   const scheduleValue = didaScheduleToNotion(task, opts)
   const completedValue = statusGroup === 'open' ? null : didaCompletedToNotion(task, opts)
   const projects = ctx.schema.tasks.props.project && ctx.projectsFor ? ctx.projectsFor(task) : null
+  // 重复任务的「任务类型」固定为「日程」（模板里有这个选项时）
+  const taskType =
+    ctx.settings.recurringAsSchedule && isRecurring(task) && ctx.schema.tasks.props.taskType && ctx.schema.tasks.taskTypeOptions.schedule
+      ? 'schedule'
+      : null
   return {
     didaId: task.id,
     projectId: task.projectId,
@@ -53,7 +63,8 @@ export function desiredFromDida(task: DidaTask, ctx: MapContext): DesiredTask {
     domainPageId: ctx.schema.tasks.props.domain ? ctx.domainFor(task.projectId) : null,
     projectPageIds: projects ? [...new Set(projects)].sort() : null,
     parentDidaId: task.parentId || null,
-    taskTypeOnCreate: hasTimeOfDay(scheduleValue) ? 'schedule' : 'todo'
+    taskTypeOnCreate: taskType ?? (hasTimeOfDay(scheduleValue) ? 'schedule' : 'todo'),
+    taskType
   }
 }
 
@@ -71,7 +82,8 @@ export function writtenFrom(desired: DesiredTask): WrittenTask {
     completedAt: desired.completedAt,
     note: desired.note,
     domainPageId: desired.domainPageId,
-    projectPageIds: desired.projectPageIds ?? []
+    projectPageIds: desired.projectPageIds ?? [],
+    taskType: desired.taskType
   }
 }
 
@@ -89,6 +101,8 @@ export interface ActualTask {
   note: string | null
   domainIds: string[]
   projectIds: string[]
+  /** 「任务类型」当前值：日程 / 待办 / 其它选项 / 未设置 */
+  taskType: 'schedule' | 'todo' | 'other' | null
   didaId: string | null
   inTrash: boolean
   createdTime?: string
@@ -122,6 +136,8 @@ export function readActual(page: NotionPage, schema: FlowSchema): ActualTask {
   const scheduleRaw = propById(page, p.schedule)?.date ?? null
   const completedRaw = p.completedAt ? (propById(page, p.completedAt)?.date ?? null) : null
   const didaRaw = plainText(propById(page, p.didaId)?.rich_text).trim()
+  const typeId = p.taskType ? (propById(page, p.taskType)?.select?.id ?? null) : null
+  const typeOptions = schema.tasks.taskTypeOptions
   return {
     pageId: page.id,
     url: page.url,
@@ -134,6 +150,7 @@ export function readActual(page: NotionPage, schema: FlowSchema): ActualTask {
     note: p.note ? normalizeNote(plainText(propById(page, p.note)?.rich_text)) : null,
     domainIds: p.domain ? (propById(page, p.domain)?.relation ?? []).map((r) => r.id) : [],
     projectIds: p.project ? (propById(page, p.project)?.relation ?? []).map((r) => r.id) : [],
+    taskType: !typeId ? null : typeId === typeOptions.schedule ? 'schedule' : typeId === typeOptions.todo ? 'todo' : 'other',
     didaId: didaRaw || null,
     inTrash: !!(page.in_trash || page.archived),
     createdTime: page.created_time,
@@ -159,6 +176,7 @@ export interface TaskPatch {
   domain?: DomainChange
   /** 同步写入的项目：set 为期望值，remove 为上次写入、现在不再需要的值 */
   projects?: { set: string[]; remove: string[] }
+  taskType?: 'schedule'
   didaId?: string
 }
 
@@ -175,6 +193,7 @@ export function patchFields(p: TaskPatch): string[] {
     note: '下一步做什么？',
     domain: '二级领域',
     projects: '关联项目',
+    taskType: '任务类型',
     didaId: '滴答ID'
   }
   return (Object.keys(p) as Array<keyof TaskPatch>).map((k) => names[k])
@@ -196,6 +215,7 @@ export function diffAgainstWritten(desired: DesiredTask, written: WrittenTask): 
     if (before.join('|') !== desired.projectPageIds.join('|'))
       patch.projects = { set: desired.projectPageIds, remove: before.filter((id) => !desired.projectPageIds!.includes(id)) }
   }
+  if (desired.taskType && desired.taskType !== (written.taskType ?? null)) patch.taskType = desired.taskType
   return patch
 }
 
@@ -227,6 +247,7 @@ export function diffAgainstActual(
     const stale = (writtenProjects ?? []).filter((id) => !desired.projectPageIds!.includes(id) && actual.projectIds.includes(id))
     if (missing.length || stale.length) patch.projects = { set: desired.projectPageIds, remove: stale }
   }
+  if (desired.taskType && actual.taskType !== desired.taskType) patch.taskType = desired.taskType
   if (actual.didaId !== desired.didaId) patch.didaId = desired.didaId
   return patch
 }
@@ -265,6 +286,10 @@ export function buildProperties(
   if (patch.note !== undefined && p.note) props[p.note] = { rich_text: toRichText(patch.note) }
   if (patch.domain !== undefined && p.domain && relationIds) props[p.domain] = { relation: relationIds.map((id) => ({ id })) }
   if (patch.projects !== undefined && p.project && projectIds) props[p.project] = { relation: projectIds.map((id) => ({ id })) }
+  if (patch.taskType !== undefined && p.taskType) {
+    const option = schema.tasks.taskTypeOptions[patch.taskType]
+    if (option) props[p.taskType] = { select: { id: option } }
+  }
   if (patch.didaId !== undefined) props[p.didaId] = { rich_text: toRichText(patch.didaId) }
   return props
 }

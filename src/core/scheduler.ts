@@ -126,11 +126,12 @@ export class Scheduler {
 
   /** 立即同步（界面按钮、睡眠唤醒、网络恢复） */
   async syncNow(opts: RoundOptions = {}): Promise<RoundResult | null> {
-    if (this.running) {
-      this.queued = { ...(this.queued ?? {}), ...opts }
-      return this.running
-    }
     return this.tick(opts)
+  }
+
+  /** 等当前这一轮结束（没有在跑时立即返回） */
+  async waitIdle(): Promise<void> {
+    await this.running?.catch(() => null)
   }
 
   /** 记录在调度器之外执行的一轮（例如首次同步），计入今日统计 */
@@ -155,10 +156,12 @@ export class Scheduler {
     const day = localDay(this.now())
     const t = this.snap.today.date === day ? { ...this.snap.today } : { date: day, created: 0, updated: 0, corrected: 0, removed: 0 }
     if (result.applied) {
-      t.created += result.summary.counts.creates
-      t.updated += result.summary.counts.updates
-      t.corrected += result.summary.counts.corrections
-      t.removed += result.summary.counts.destructive
+      // 只统计实际执行的操作（熔断时被暂缓的修改不计入）
+      const c = result.appliedCounts ?? result.summary.counts
+      t.created += c.creates
+      t.updated += c.updates
+      t.corrected += c.corrections
+      t.removed += c.destructive
     }
     this.snap.today = t
   }
@@ -166,6 +169,11 @@ export class Scheduler {
   private async tick(opts: RoundOptions): Promise<RoundResult | null> {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
+    // 同一时间只跑一轮：正在跑时把参数合并进队列，这一轮结束后立即再跑
+    if (this.running) {
+      this.queued = { ...(this.queued ?? {}), ...opts }
+      return this.running
+    }
     const settings = this.deps.settings()
     const engine = this.deps.engine()
     if (!engine) {
@@ -181,7 +189,8 @@ export class Scheduler {
         const interval =
           result.writes > 0 ? settings.pollMinSec : Math.min(settings.pollMaxSec, Math.round(this.snap.intervalSec * 1.5))
         this.set({
-          status: result.blocked ? 'blocked' : 'idle',
+          // 这一轮进行中被暂停：保持“已暂停”，不要显示成正常
+          status: this.paused ? 'paused' : result.blocked ? 'blocked' : 'idle',
           lastSuccessAt: this.now().toISOString(),
           lastError: null,
           pending: result.blocked,
@@ -203,7 +212,7 @@ export class Scheduler {
           return null
         }
         this.backoffSec = Math.min(900, this.backoffSec ? this.backoffSec * 2 : Math.max(30, settings.pollMaxSec))
-        this.set({ status: 'error', lastError: err })
+        this.set({ status: this.paused ? 'paused' : 'error', lastError: err })
         this.schedule(this.backoffSec)
         return null
       }
@@ -216,7 +225,7 @@ export class Scheduler {
       if (this.queued) {
         const next = this.queued
         this.queued = null
-        void this.tick(next)
+        if (!this.paused || next.approve || next.forceReconcile || next.forceStructure) void this.tick(next)
       }
     }
   }

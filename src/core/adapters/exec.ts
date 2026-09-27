@@ -159,15 +159,19 @@ export function redact(text: string): string {
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
-/** 对可重试错误做指数退避重试 */
-export async function withRetry<T>(fn: () => Promise<T>, attempts = 4, baseMs = 1000): Promise<T> {
+/**
+ * 对可重试错误做指数退避重试。
+ * `onlyRateLimit`：不幂等的请求（新建页面、追加块）只在限流时重试——超时或网络错误时请求可能已经成功，重试会产生重复。
+ */
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 4, baseMs = 1000, onlyRateLimit = false): Promise<T> {
   let lastErr: unknown
   for (let i = 0; i < attempts; i++) {
     try {
       return await fn()
     } catch (e) {
       lastErr = e
-      if (!(e instanceof CliError) || !e.retryable || i === attempts - 1) throw e
+      const retry = e instanceof CliError && (onlyRateLimit ? e.kind === 'rate_limit' : e.retryable)
+      if (!retry || i === attempts - 1) throw e
       const wait = e.kind === 'rate_limit' ? baseMs * 2 ** (i + 1) : baseMs * 2 ** i
       await sleep(wait)
     }

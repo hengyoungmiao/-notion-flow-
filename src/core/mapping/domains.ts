@@ -1,4 +1,4 @@
-import type { DidaGroup, DidaProject, DomainLink, DomainMapping, WorkspaceProfile, WorkspaceState } from '../types'
+import type { DidaGroup, DidaProject, DomainLink, DomainMapping, ListLifecycle, WorkspaceProfile, WorkspaceState } from '../types'
 import { normalizeTitle } from './text'
 
 export interface NotionDomainPage {
@@ -39,7 +39,7 @@ export interface DomainRow {
   didaId: string
   didaName: string
   groupId: string | null
-  status: 'linked' | 'matched' | 'create' | 'skip' | 'none' | 'broken' | 'excluded'
+  status: 'linked' | 'matched' | 'create' | 'skip' | 'none' | 'broken' | 'excluded' | 'archived' | 'deleted'
   notionPageId: string | null
   notionTitle: string | null
   mode: DomainMapping['mode'] | 'created' | null
@@ -52,7 +52,7 @@ export interface DomainInput {
   notionDomains: NotionDomainPage[]
   notionAreas: NotionAreaPage[]
   profile: Pick<WorkspaceProfile, 'scope' | 'mappings'>
-  state: Pick<WorkspaceState, 'domains'>
+  state: Pick<WorkspaceState, 'domains'> & { lists?: ListLifecycle }
   autoCreate: boolean
   /** 结构数据库不可用（例如未识别到领域库）时只做范围计算 */
   domainsAvailable: boolean
@@ -60,7 +60,12 @@ export interface DomainInput {
 }
 
 export function isTaskList(p: DidaProject): boolean {
-  return (p.kind ?? 'TASK').toUpperCase() !== 'NOTE' && !p.closed
+  return isTaskKind(p) && !p.closed
+}
+
+/** 任务清单（不含笔记清单），不管是否归档 */
+export function isTaskKind(p: DidaProject): boolean {
+  return (p.kind ?? 'TASK').toUpperCase() !== 'NOTE'
 }
 
 export function planDomains(input: DomainInput): DomainPlan {
@@ -118,7 +123,8 @@ export function planDomains(input: DomainInput): DomainPlan {
         ops.push({ kind: 'linkArea', groupId: group.id, link: newLink(group.id, area.pageId, 'map', group.name) })
       continue
     }
-    if (link && mapping.mode !== 'create') {
+    // 「新建同名」只执行一次：已经新建过且页面还在，就沿用
+    if (link && (mapping.mode !== 'create' || (link.mode === 'created' && areaById.has(link.pageId)))) {
       const area = areaById.get(link.pageId)
       if (!area) {
         warnings.push(`一级领域「${link.lastName}」在 Notion 中已被删除，文件夹「${group.name}」暂不绑定一级领域`)
@@ -152,8 +158,11 @@ export function planDomains(input: DomainInput): DomainPlan {
   }
 
   // ── 清单 → 二级领域 ──
+  // 只有还在使用的清单才占用二级领域：已归档/已删除清单原来的领域可以被同名新清单接回
+  const activeLists = new Set(input.projects.filter(isTaskList).map((p) => p.id))
   const claimedDomains = new Set<string>()
-  for (const link of Object.values(input.state.domains.lists)) if (domainById.has(link.pageId)) claimedDomains.add(link.pageId)
+  for (const [projectId, link] of Object.entries(input.state.domains.lists))
+    if (activeLists.has(projectId) && domainById.has(link.pageId)) claimedDomains.add(link.pageId)
 
   for (const project of input.projects) {
     if (!isTaskList(project)) continue
@@ -196,7 +205,8 @@ export function planDomains(input: DomainInput): DomainPlan {
       Object.assign(row, { status: 'linked', notionPageId: pageId, notionTitle: domain.title })
       if (!link || link.pageId !== pageId || link.mode !== 'map')
         ops.push({ kind: 'linkDomain', projectId: project.id, link: newLink(project.id, pageId, 'map', project.name, link?.writtenAreaPageId) })
-    } else if (link && mapping.mode !== 'create') {
+    } else if (link && (mapping.mode !== 'create' || (link.mode === 'created' && domainById.has(link.pageId)))) {
+      // 「新建同名」只执行一次：已经新建过且页面还在，就沿用
       const domain = domainById.get(link.pageId)
       if (!domain) {
         warnings.push(`二级领域「${link.lastName}」在 Notion 中已被删除，清单「${project.name}」的任务暂时保持原有领域`)
@@ -252,6 +262,38 @@ export function planDomains(input: DomainInput): DomainPlan {
       else if (areaRef && !areaRef.startsWith('pending:') && written !== areaRef && link)
         ops.push({ kind: 'linkDomain', projectId: project.id, link: { ...link, writtenAreaPageId: areaRef } })
     }
+  }
+
+  // ── 已归档 / 已删除的清单：只展示，不产生警告、不参与同步范围 ──
+  const domainTitle = (link: DomainLink | undefined) =>
+    link ? (domainById.get(link.pageId)?.title ?? link.lastName) : null
+  for (const project of input.projects) {
+    if (!isTaskKind(project) || !project.closed) continue
+    const link = input.state.domains.lists[project.id]
+    if (!link) continue
+    rows.push({
+      type: 'list',
+      didaId: project.id,
+      didaName: project.name,
+      groupId: project.groupId ?? null,
+      status: 'archived',
+      notionPageId: link.pageId,
+      notionTitle: domainTitle(link),
+      mode: link.mode
+    })
+  }
+  for (const [projectId, entry] of Object.entries(input.state.lists?.deleted ?? {})) {
+    const link = input.state.domains.lists[projectId]
+    rows.push({
+      type: 'list',
+      didaId: projectId,
+      didaName: entry.name,
+      groupId: null,
+      status: 'deleted',
+      notionPageId: link?.pageId ?? null,
+      notionTitle: domainTitle(link),
+      mode: link?.mode ?? null
+    })
   }
 
   return { listMap, scopeProjectIds, ops, warnings, rows }

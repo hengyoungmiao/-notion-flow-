@@ -26,7 +26,18 @@ function pushText(out: RichTextRequest[], content: string, annotations?: Annotat
 }
 
 const INLINE =
-  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*|__[^_\n]+__)|(~~[^~\n]+~~)|(!\[[^\]\n]*\]\([^)\s]+\))|(\[[^\]\n]+\]\((https?:\/\/[^)\s]+)\))|(\*[^*\s][^*\n]*\*)|(https?:\/\/[^\s<>()（）]+)/g
+  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*|__[^_\n]+__)|(~~[^~\n]+~~)|(!\[[^\]\n]*\]\([^)\s]+\))|(\[[^\]\n]+\]\((https?:\/\/[^)\s]+)\))|(\*[^*\s][^*\n]*\*)|(https?:\/\/[^\s<>()（）\u3000-\u9fff\uff00-\uffef]+)/g
+
+/** 只把 Notion 能接受的链接写成链接（http/https、能解析、不超过 2000 字），否则按普通文字处理 */
+export function safeUrl(url: string): string | undefined {
+  if (url.length > 2000) return undefined
+  try {
+    const u = new URL(url)
+    return u.protocol === 'http:' || u.protocol === 'https:' ? url : undefined
+  } catch {
+    return undefined
+  }
+}
 
 /** 行内格式：`代码`、**加粗**、*斜体*、~~删除线~~、[链接](url)、裸链接；图片显示为“[图片]” */
 export function inlineRichText(text: string, base: Annotations = {}): RichTextRequest[] {
@@ -40,9 +51,14 @@ export function inlineRichText(text: string, base: Annotations = {}): RichTextRe
     else if (m[2]) pushText(out, token.slice(2, -2), { ...base, bold: true })
     else if (m[3]) pushText(out, token.slice(2, -2), { ...base, strikethrough: true })
     else if (m[4]) pushText(out, '[图片]', { ...base, color: 'gray' })
-    else if (m[5]) pushText(out, token.slice(1, token.indexOf('](')), base, m[6])
+    else if (m[5]) pushText(out, token.slice(1, token.indexOf('](')), base, safeUrl(m[6]!))
     else if (m[7]) pushText(out, token.slice(1, -1), { ...base, italic: true })
-    else if (m[8]) pushText(out, token, base, token)
+    else if (m[8]) {
+      // 裸链接末尾的标点不算链接的一部分
+      const url = token.replace(/[.,;:!?'"\]]+$/, '')
+      pushText(out, url, base, safeUrl(url))
+      pushText(out, token.slice(url.length), base)
+    }
     last = at + token.length
   }
   pushText(out, text.slice(last), base)

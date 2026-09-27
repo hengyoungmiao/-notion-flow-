@@ -82,6 +82,12 @@ export class AppController implements FlowSyncApi {
   ) {
     this.config = new ConfigStore(rootDir)
     this.store = new FileStateStore(this.config.stateDir)
+    this.store.onRecovered = () =>
+      this.activity.push({
+        kind: 'warning',
+        title: '同步记录文件损坏，已备份并重建',
+        detail: '下一轮会按「滴答ID」把已有的 Notion 页面重新关联，不会重复创建'
+      })
     this.notionLogin = new NotionLogin(hooks.ntnPath)
     this.didaAuth = new DidaAuth(() => hooks.didaCommand())
     this.versions = { app: hooks.appVersion, ntn: null, dida: null, electron: hooks.electronVersion }
@@ -117,6 +123,8 @@ export class AppController implements FlowSyncApi {
     this.hooks.setLaunchAtLogin(c.settings.launchAtLogin, c.settings.startMinimized)
     void this.didaCheck()
     await this.upgradeSchemas()
+    if (this.config.recovered)
+      this.activity.push({ kind: 'warning', title: '配置文件损坏，已从最近一次保存的备份恢复', detail: '损坏的文件已改名保留在数据目录' })
     if (c.onboarded) this.scheduler.start()
   }
 
@@ -173,6 +181,10 @@ export class AppController implements FlowSyncApi {
       profile: ws,
       settings,
       log: (e) => this.activity.push(e),
+      onSchemaChange: (schema) => {
+        const current = this.config.get().workspaces.find((w) => w.id === ws.id)
+        if (current) void this.config.upsertWorkspace({ ...current, schema }).catch(() => undefined)
+      },
       backup: (data) => writeBackup(this.config.backupDir, ws.name, data)
     })
   }
@@ -408,7 +420,14 @@ export class AppController implements FlowSyncApi {
       else await this.notionLogin.poll(id, this.config.notionHome(id))
       await this.config.upsertWorkspace({ ...ws, auth: { type: 'ntn' } })
       await this.refreshWhoami(id)
+      this.resumeAfterNotionLogin(id)
     })
+  }
+
+  /** Notion 登录失效导致的暂停：重新登录后自动恢复同步（和滴答一致） */
+  private resumeAfterNotionLogin(id: string): void {
+    const s = this.scheduler.snapshot()
+    if (s.status === 'auth' && s.lastError?.tool === 'ntn' && id === this.config.get().activeWorkspaceId) this.scheduler.resume()
   }
 
   async notionLoginCancel(id: string): Promise<void> {
@@ -421,6 +440,7 @@ export class AppController implements FlowSyncApi {
       if (!token.trim()) throw new Error('请输入集成 token')
       await this.config.upsertWorkspace({ ...ws, auth: { type: 'token', tokenEnc: this.hooks.encrypt(token.trim()) } })
       await this.refreshWhoami(id)
+      this.resumeAfterNotionLogin(id)
     })
   }
 
@@ -522,7 +542,10 @@ export class AppController implements FlowSyncApi {
   async startInitialSync(id: string) {
     return guard(async () => {
       const ws = this.workspace(id)
+      const wasPaused = this.scheduler.isPaused
       this.scheduler.pause()
+      // 等正在进行的一轮结束，避免和首次同步同时写入
+      await this.scheduler.waitIdle()
       try {
         const res = await this.engineFor(ws).runRound({ initial: true, forceStructure: true })
         this.scheduler.record(res)
@@ -537,7 +560,7 @@ export class AppController implements FlowSyncApi {
         return { backupPath: res.backupPath, summary: res.summary }
       } finally {
         this.engineCache = null
-        this.scheduler.resume()
+        if (!wasPaused) this.scheduler.resume()
         this.scheduler.start()
       }
     })

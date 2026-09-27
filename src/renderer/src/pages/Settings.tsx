@@ -38,12 +38,21 @@ export default function Settings({ state }: { state: AppViewState }) {
             </Form.Item>
             <Form.Item
               label="页面顶部的滴答同步区"
-              extra="把描述、检查事项（可勾选）、子任务清单、重复规则和完成记录写到任务页面最上方；页面其余正文和「下一步做什么？」不受影响。"
+              extra="把描述、检查事项（可勾选）、子任务清单、重复规则和完成记录写到任务页面最上方；页面其余正文和「下一步做什么？」不受影响。关闭后会清掉已有的同步区。"
             >
               <Switch checked={s.syncBody} onChange={(v) => void save({ syncBody: v })} />
             </Form.Item>
             <Form.Item label="滴答标签自动关联 FLO.W 项目" extra="任务打上与项目同名的标签（如 #网站改版）就会关联到该项目，项目进度随之更新；子任务继承父任务的项目。">
               <Switch checked={s.syncProjects} onChange={(v) => void save({ syncProjects: v })} />
+            </Form.Item>
+            <Form.Item label="重复任务按日程处理" extra="重复任务的「任务类型」固定为「日程」（Notion 里改掉会被改回），并且不按标签关联项目。">
+              <Switch checked={s.recurringAsSchedule} onChange={(v) => void save({ recurringAsSchedule: v })} />
+            </Form.Item>
+            <Form.Item
+              label="滴答清单归档后，其中未完成的任务标记完成"
+              extra="完成日期填检测到归档的那天；清单重新打开后恢复按滴答的实际状态同步。关闭时只解除关联，页面保持原样。"
+            >
+              <Switch checked={s.archivedListsComplete} onChange={(v) => void save({ archivedListsComplete: v })} />
             </Form.Item>
             <Form.Item label="同步番茄钟和正计时记录" extra="写入 FLO.W「任务番茄数据库」，并关联到对应任务；任务的「番茄时长统计」会自动计算。">
               <Space>
@@ -62,7 +71,7 @@ export default function Settings({ state }: { state: AppViewState }) {
             <Form.Item label="滴答新增的清单/文件夹自动在 Notion 新建领域">
               <Switch checked={s.autoCreateDomains} onChange={(v) => void save({ autoCreateDomains: v })} />
             </Form.Item>
-            <Form.Item label="重复任务每次完成都在 Notion 记一条" extra="关闭时只更新原任务往后推的排期。">
+            <Form.Item label="重复任务每次完成都在 Notion 另建一条" extra="关闭时（推荐）不另建页面，完成记录写在原任务同步区的“最近完成”里。">
               <Switch checked={s.recurringCompletionRecords} onChange={(v) => void save({ recurringCompletionRecords: v })} />
             </Form.Item>
             <Form.Item label="新建任务时套用 FLO.W 默认任务模板" extra="实验性：请先确认模板不会覆盖同步写入的属性。">

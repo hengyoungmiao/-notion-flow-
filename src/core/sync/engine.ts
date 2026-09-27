@@ -1,8 +1,8 @@
 import type { ActivitySink } from '../activity'
-import { listFocusRange, type DidaReader } from '../adapters/dida'
+import { listCompletedRange, listFocusRange, type DidaReader } from '../adapters/dida'
 import { CliError } from '../adapters/exec'
 import { queryAll, type NotionClient } from '../adapters/notion'
-import { planDomains, type DomainOp, type DomainPlan, type NotionAreaPage, type NotionDomainPage } from '../mapping/domains'
+import { isTaskList, planDomains, type DomainOp, type DomainPlan, type NotionAreaPage, type NotionDomainPage } from '../mapping/domains'
 import {
   buildCreateProperties,
   buildProperties,
@@ -20,6 +20,7 @@ import { plainText, toRichText } from '../mapping/text'
 import { buildFocusProperties, focusPageStartKey } from '../mapping/focus'
 import { BODY_TITLE, containerBlock } from '../mapping/body'
 import { missingInWindow, planFocus, type FocusOp } from './focus'
+import { trackLists, type ListTracking } from './lists'
 import type {
   AppSettings,
   DesiredTask,
@@ -34,6 +35,7 @@ import type {
   WorkspaceProfile,
   WorkspaceState
 } from '../types'
+import { refreshTaskSchema } from '../notion/schema'
 import { evaluateBreaker, safeSubset } from './guard'
 import { countOps, describeOp, isInbox, planTasks, projectKey, type PlanCounts, type TaskOp } from './planner'
 import type { StateStore } from './state'
@@ -45,6 +47,8 @@ export interface EngineDeps {
   profile: WorkspaceProfile
   settings: AppSettings
   log?: ActivitySink
+  /** 刷新结构时发现任务库字段有变化（新增状态选项、字段被删除等），由调用方保存 */
+  onSchemaChange?: (schema: FlowSchema) => void
   /** 首次同步正式执行前的备份钩子 */
   backup?: (data: { pages: NotionPage[]; tasks: DidaTask[]; projects: DidaProject[] }) => Promise<string>
   now?: () => Date
@@ -91,6 +95,8 @@ export interface RoundResult {
   blocked: PendingApproval | null
   /** 本轮实际写入 Notion 的次数（用于自适应轮询） */
   writes: number
+  /** 实际执行的操作计数（熔断时只算执行了的安全子集；预览时为 0） */
+  appliedCounts: PlanCounts
   reconciled: boolean
   backupPath: string | null
   durationMs: number
@@ -105,6 +111,8 @@ interface Structure {
   areas: NotionAreaPage[]
   /** FLO.W 项目（按标签匹配） */
   flowProjects: Array<{ pageId: string; title: string }>
+  /** 任务库字段核对发现的问题 */
+  schemaIssues: string[]
 }
 
 interface FocusLoad {
@@ -117,6 +125,8 @@ interface FocusLoad {
 const FOCUS_INTERVAL_MS = 60_000
 /** 每轮最多重写的同步区数量 */
 const BODY_LIMIT = 40
+/** 同样内容写入失败后，多久内不再重试 */
+const FAILURE_BACKOFF_MS = 30 * 60_000
 
 export class NeedsInitialSyncError extends Error {
   constructor() {
@@ -127,16 +137,20 @@ export class NeedsInitialSyncError extends Error {
 
 export class SyncEngine {
   private structure: Structure | null = null
+  /** 刷新结构时重新核对过的任务库绑定 */
+  private schemaOverride: FlowSchema | null = null
   private lastFocusAt = 0
   private focusWarned = false
   private readonly now: () => Date
+  /** 写入失败记录：操作 → 内容指纹、下次允许重试的时间 */
+  private readonly failures = new Map<string, { fp: string; until: number }>()
 
   constructor(private readonly deps: EngineDeps) {
     this.now = deps.now ?? (() => new Date())
   }
 
   get schema(): FlowSchema {
-    const s = this.deps.profile.schema
+    const s = this.schemaOverride ?? this.deps.profile.schema
     if (!s || !s.tasks.props.didaId) throw new Error('工作空间尚未完成 FLO.W 数据库识别')
     return s
   }
@@ -155,6 +169,7 @@ export class SyncEngine {
     const ttl = this.deps.settings.structureMinutes * 60_000
     if (!force && this.structure && this.now().getTime() - this.structure.at < ttl) return this.structure
     const { dida, notion } = this.deps
+    const schemaIssues = await this.refreshSchema()
     const schema = this.schema
     const [projects, groups, preference] = await Promise.all([dida.listProjects(), dida.listGroups(), dida.getPreference()])
     let domains: NotionDomainPage[] = []
@@ -182,8 +197,28 @@ export class SyncEngine {
         title: plainText(propById(p, pr.props.title)?.title)
       }))
     }
-    this.structure = { at: this.now().getTime(), projects, groups, preference, domains, areas, flowProjects }
+    this.structure = { at: this.now().getTime(), projects, groups, preference, domains, areas, flowProjects, schemaIssues }
     return this.structure
+  }
+
+  /** 重新读取任务库的字段定义，按属性 ID 核对绑定 */
+  private async refreshSchema(): Promise<string[]> {
+    const current = this.schema
+    let ds
+    try {
+      ds = await this.deps.notion.getDataSource(current.tasks.dataSourceId)
+    } catch (e) {
+      if (e instanceof CliError && e.kind === 'not_found')
+        throw new Error('找不到 FLO.W 任务库（可能已被删除，或当前 Notion 账号没有访问权限），请到「工作空间」重新识别')
+      throw e
+    }
+    const r = refreshTaskSchema(current, ds)
+    if (r.fatal) throw new Error(r.fatal)
+    if (r.changed) {
+      this.schemaOverride = r.schema
+      this.deps.onSchemaChange?.(r.schema)
+    }
+    return r.issues
   }
 
   private async loadTasks(state: WorkspaceState, initial: boolean, now: Date, scope: Set<string>): Promise<DidaTask[]> {
@@ -199,35 +234,69 @@ export class SyncEngine {
     let from: number
     if (initial) from = now.getTime() - Math.max(1, profile.scope.importCompletedDays) * day
     else from = (state.lastSuccessAt ? Date.parse(state.lastSuccessAt) : now.getTime()) - day
-    const completed = await dida.listCompletedTasks(new Date(from), now)
+    const completed = await listCompletedRange(dida, new Date(from), now)
     const byId = new Map<string, DidaTask>()
     for (const t of completed) byId.set(t.id, t)
     for (const t of open) byId.set(t.id, t)
     return [...byId.values()]
   }
 
-  /** 链接任务缺席时逐条确认（先查原清单，再查不参与同步的清单） */
+  /**
+   * 链接任务缺席时确认它去了哪里：
+   * 先一次读取所有清单（含不同步的清单和收件箱）的未完成任务——任务可能只是被移走了；
+   * 剩下的再向原清单逐条查询（已完成/已放弃的任务），查不到才算删除。
+   * 归档清单和已删除清单里的任务另行处理，不在这里确认。
+   */
   private async confirmMissing(
     state: WorkspaceState,
     seen: Set<string>,
-    structure: Structure,
-    scope: Set<string>
+    tracking: ListTracking,
+    structure: Structure
   ): Promise<Map<string, DidaTask | null>> {
+    const { dida, profile } = this.deps
     const result = new Map<string, DidaTask | null>()
     // 已经以“完成/放弃”写入 Notion 的任务不再逐条确认（重新打开时会出现在未完成列表里）
-    const missing = Object.values(state.tasks).filter((l) => !seen.has(l.didaId) && l.written.statusGroup === 'open')
-    const others = structure.projects.filter((p) => !scope.has(p.id)).map((p) => p.id)
-    for (const link of missing.slice(0, 60)) {
-      let found = await this.deps.dida.getTask(link.projectId, link.didaId)
-      if (!found) {
-        for (const pid of others.filter((p) => p !== link.projectId).slice(0, 10)) {
-          found = await this.deps.dida.getTask(pid, link.didaId)
-          if (found) break
-        }
-      }
-      result.set(link.didaId, found)
+    const missing = Object.values(state.tasks).filter(
+      (l) =>
+        !seen.has(l.didaId) &&
+        l.written.statusGroup === 'open' &&
+        !tracking.archived.has(l.projectId) &&
+        !tracking.deleted.has(l.projectId)
+    )
+    if (missing.length === 0) return result
+    // 明确列出所有未归档的任务清单（包括不同步的），不依赖接口“不带参数时返回什么”
+    const everywhere = new Map<string, DidaTask>()
+    const allLists = structure.projects.filter(isTaskList).map((p) => p.id)
+    if (allLists.length) for (const t of await dida.listOpenTasks(allLists)) everywhere.set(t.id, t)
+    if (!profile.scope.includeInbox) {
+      let inbox = await dida.listInboxTasks()
+      if (inbox === null) inbox = (await dida.listOpenTasks()).filter((t) => isInbox(t.projectId))
+      for (const t of inbox) everywhere.set(t.id, t)
     }
+    const rest: typeof missing = []
+    for (const link of missing) {
+      const moved = everywhere.get(link.didaId)
+      if (moved) result.set(link.didaId, moved)
+      else rest.push(link)
+    }
+    for (const link of rest.slice(0, 60)) result.set(link.didaId, await dida.getTask(link.projectId, link.didaId))
     return result
+  }
+
+  /** 清单的归档/删除情况（检测日期按滴答时区的本地日期） */
+  private trackLists(state: WorkspaceState, structure: Structure, zone: string): ListTracking {
+    const known = new Set<string>()
+    const names: Record<string, string> = {}
+    for (const [id, link] of Object.entries(state.domains.lists)) {
+      known.add(id)
+      names[id] = link.lastName
+    }
+    for (const link of Object.values(state.tasks)) if (!isInbox(link.projectId)) known.add(link.projectId)
+    return trackLists({ prev: state.lists, projects: structure.projects, knownProjectIds: known, names, now: this.now(), zone })
+  }
+
+  private zoneOf(structure: Structure): string {
+    return (typeof structure.preference.timeZone === 'string' && structure.preference.timeZone) || this.deps.settings.defaultTimeZone
   }
 
   private async loadLinkedPages(): Promise<{ map: Map<string, ActualTask[]>; pages: NotionPage[] }> {
@@ -296,20 +365,21 @@ export class SyncEngine {
     const schema = this.schema
     const state = await this.deps.store.load(this.deps.profile.id)
     const structure = await this.loadStructure(force)
+    const tracking = this.trackLists(state, structure, this.zoneOf(structure))
     const plan = planDomains({
       projects: structure.projects,
       groups: structure.groups,
       notionDomains: structure.domains,
       notionAreas: structure.areas,
       profile: this.deps.profile,
-      state,
+      state: { ...state, lists: tracking.lists },
       autoCreate: this.deps.settings.autoCreateDomains,
       domainsAvailable: !!schema.domains && !!schema.tasks.props.domain,
       areasAvailable: !!schema.areas && !!schema.domains?.props.area
     })
     return {
       rows: plan.rows,
-      warnings: plan.warnings,
+      warnings: [...structure.schemaIssues, ...plan.warnings],
       notionDomains: structure.domains.map((d) => ({ pageId: d.pageId, title: d.title })),
       notionAreas: structure.areas.map((a) => ({ pageId: a.pageId, title: a.title })),
       tagProjects: await this.tagProjectTable(structure)
@@ -338,13 +408,20 @@ export class SyncEngine {
     if (!state.initializedAt && !initial) throw new NeedsInitialSyncError()
 
     const structure = await this.loadStructure(!!opts.forceStructure || initial)
+    if (structure.projects.length === 0 && Object.keys(state.tasks).length > 0) {
+      // 已经同步过任务，清单列表却是空的：多半是接口异常，跳过这一轮，避免把所有任务当成移走或删除
+      this.invalidateStructure()
+      throw new CliError('滴答清单返回的清单列表为空，本轮跳过（避免误删），稍后自动重试', 'dida', 'server')
+    }
+    const zone = this.zoneOf(structure)
+    const tracking = this.trackLists(state, structure, zone)
     const domainPlan = planDomains({
       projects: structure.projects,
       groups: structure.groups,
       notionDomains: structure.domains,
       notionAreas: structure.areas,
       profile,
-      state,
+      state: { ...state, lists: tracking.lists },
       autoCreate: settings.autoCreateDomains,
       domainsAvailable: !!schema.domains && !!schema.tasks.props.domain,
       areasAvailable: !!schema.areas && !!schema.domains?.props.area
@@ -352,7 +429,7 @@ export class SyncEngine {
 
     const tasks = await this.loadTasks(state, initial, now, domainPlan.scopeProjectIds)
     const seen = new Set(tasks.map((t) => t.id))
-    const confirmations = await this.confirmMissing(state, seen, structure, domainPlan.scopeProjectIds)
+    const confirmations = await this.confirmMissing(state, seen, tracking, structure)
 
     const reconcileDue =
       initial ||
@@ -391,21 +468,21 @@ export class SyncEngine {
       pageChecks,
       candidates,
       projects: structure.flowProjects,
+      lists: { archived: tracking.archived, deleted: tracking.deleted },
       initial,
       now
     })
-    const warnings = [...domainPlan.warnings, ...plan.warnings]
+    const warnings = [...structure.schemaIssues, ...domainPlan.warnings, ...plan.warnings]
     const summary = summarize(plan.ops, domainPlan, warnings)
-    const zone =
-      (typeof structure.preference.timeZone === 'string' && structure.preference.timeZone) || settings.defaultTimeZone
     const focusLoad = await this.loadFocus(state, now, initial, !!opts.forceReconcile)
 
     let ops = plan.ops
     let blocked: PendingApproval | null = null
     if (!initial && !opts.approve) {
       const verdict = evaluateBreaker(ops, Object.keys(state.tasks).length, settings.breaker, now)
-      if (verdict.blocked) {
-        blocked = verdict.pending
+      if (verdict.blocked && verdict.pending) {
+        // 同一次等待确认期间沿用最初的时间，避免每一轮都当成新的一次（重复通知）
+        blocked = { ...verdict.pending, createdAt: state.pendingApproval?.createdAt ?? verdict.pending.createdAt }
         ops = safeSubset(ops)
       }
     }
@@ -433,7 +510,16 @@ export class SyncEngine {
         })
         summary.focus = countFocus(focusOps)
       }
-      return { summary, applied: false, blocked, writes: 0, reconciled: reconcileDue, backupPath: null, durationMs: Date.now() - started }
+      return {
+        summary,
+        applied: false,
+        blocked,
+        writes: 0,
+        appliedCounts: countOps([]),
+        reconciled: reconcileDue,
+        backupPath: null,
+        durationMs: Date.now() - started
+      }
     }
 
     let backupPath: string | null = null
@@ -444,6 +530,9 @@ export class SyncEngine {
         projects: structure.projects
       })
     }
+
+    // 归档/删除记录先落盘：熔断或中途出错时，检测日期也不会变
+    this.applyListTracking(tracking, state)
 
     const writes = { count: 0 }
     try {
@@ -468,7 +557,7 @@ export class SyncEngine {
         if (!initial && !opts.approve && (blocked || trashes > settings.breaker.maxTrash)) {
           if (!blocked && trashes > 0)
             blocked = {
-              createdAt: now.toISOString(),
+              createdAt: state.pendingApproval?.createdAt ?? now.toISOString(),
               reason: `计划删除 ${trashes} 条番茄记录（上限 ${settings.breaker.maxTrash}）`,
               trash: trashes,
               updates: 0,
@@ -494,7 +583,31 @@ export class SyncEngine {
     if (initial) state.initializedAt = now.toISOString()
     await store.save(state)
 
-    return { summary, applied: true, blocked, writes: writes.count, reconciled: reconcileDue, backupPath, durationMs: Date.now() - started }
+    return {
+      summary,
+      applied: true,
+      blocked,
+      writes: writes.count,
+      appliedCounts: countOps(ops),
+      reconciled: reconcileDue,
+      backupPath,
+      durationMs: Date.now() - started
+    }
+  }
+
+  private applyListTracking(tracking: ListTracking, state: WorkspaceState): void {
+    state.lists = tracking.lists
+    for (const id of tracking.expired) delete state.domains.lists[id]
+    for (const e of tracking.events) {
+      if (e.kind === 'archived')
+        this.log({
+          kind: 'domain',
+          title: `清单「${e.name}」已归档`,
+          detail: this.deps.settings.archivedListsComplete ? '其中未完成的任务会在 Notion 标记完成' : '其中的任务已解除关联'
+        })
+      else if (e.kind === 'reopened') this.log({ kind: 'domain', title: `清单「${e.name}」已重新打开，恢复按滴答状态同步` })
+      else this.log({ kind: 'domain', title: `清单「${e.name}」已在滴答删除`, detail: '其中的任务按「删除任务」设置处理' })
+    }
   }
 
   // ───────────────────────── 写入：领域结构 ─────────────────────────
@@ -623,7 +736,13 @@ export class SyncEngine {
     let sinceSave = 0
     // 同步区最后写（新建的页面此时已有 ID），每轮最多 BODY_LIMIT 个，其余下一轮继续
     const ops = [...allOps.filter((o) => o.kind !== 'body'), ...allOps.filter((o) => o.kind === 'body').slice(0, BODY_LIMIT)]
+    const nowMs = this.now().getTime()
     for (const op of ops) {
+      // 同样的内容刚刚写入失败过：30 分钟内不再重试（内容变化后立即重试）
+      const key = failureKey(op)
+      const fp = key ? fingerprint(op) : ''
+      const memo = key ? this.failures.get(key) : undefined
+      if (memo && memo.fp === fp && memo.until > nowMs) continue
       try {
         switch (op.kind) {
           case 'create': {
@@ -650,8 +769,13 @@ export class SyncEngine {
           case 'update': {
             const desired = this.resolved(op.desired, state)
             await this.applyUpdate(desired, op.pageId, op.actual ?? null, state, writes, op.patch)
-            const kind = op.reason === 'drift' ? 'correct' : op.reason === 'dida' ? 'update' : 'relink'
-            const title = op.reason === 'drift' ? `已按滴答校正「${desired.title}」` : desired.title
+            const kind = op.reason === 'drift' ? 'correct' : op.reason === 'dida' || op.reason === 'archived' ? 'update' : 'relink'
+            const title =
+              op.reason === 'drift'
+                ? `已按滴答校正「${desired.title}」`
+                : op.reason === 'archived'
+                  ? `清单已归档，任务标记完成「${desired.title}」`
+                  : desired.title
             this.log({ kind, title, detail: patchFields(op.patch).join('、'), didaId: desired.didaId, pageId: op.pageId })
             break
           }
@@ -663,19 +787,29 @@ export class SyncEngine {
             await notion.updatePage(op.pageId, { in_trash: true })
             writes.count++
             delete state.tasks[op.didaId]
-            this.log({ kind: 'trash', title: `滴答中已删除，Notion 页面移入回收站「${op.title}」`, didaId: op.didaId, pageId: op.pageId })
+            this.log({
+              kind: 'trash',
+              title: `${op.listDeleted ? '清单已在滴答删除' : '滴答中已删除'}，Notion 页面移入回收站「${op.title}」`,
+              didaId: op.didaId,
+              pageId: op.pageId
+            })
             break
           case 'abandon':
             await notion.updatePage(op.pageId, { properties: buildProperties({ status: 'abandoned' }, schema) })
             writes.count++
             delete state.tasks[op.didaId]
-            this.log({ kind: 'abandon', title: `滴答中已删除，标记为放弃「${op.title}」`, didaId: op.didaId, pageId: op.pageId })
+            this.log({
+              kind: 'abandon',
+              title: `${op.listDeleted ? '清单已在滴答删除' : '滴答中已删除'}，标记为放弃「${op.title}」`,
+              didaId: op.didaId,
+              pageId: op.pageId
+            })
             break
           case 'unlink':
             delete state.tasks[op.didaId]
             this.log({
               kind: 'unlink',
-              title: op.reason === 'out_of_scope' ? `任务移出同步范围，已解除关联「${op.title}」` : `滴答中已删除，已解除关联「${op.title}」`,
+              title: `${UNLINK_TEXT[op.reason]}，已解除关联「${op.title}」`,
               didaId: op.didaId,
               pageId: op.pageId
             })
@@ -698,8 +832,17 @@ export class SyncEngine {
             writes.count += await this.applyBody(op, state)
             break
         }
+        if (key) this.failures.delete(key)
       } catch (e) {
         if (e instanceof CliError && (e.kind === 'validation' || e.kind === 'not_found')) {
+          // 页面已在 Notion 删除（常见报错：找不到页面、不能编辑已归档的块）
+          if ((e.kind === 'not_found' || /archived|in_trash|in the trash/i.test(e.message)) && (await this.handleGonePage(op, state)))
+            continue
+          if (key) {
+            const repeated = this.failures.get(key)?.fp === fp
+            this.failures.set(key, { fp, until: nowMs + FAILURE_BACKOFF_MS })
+            if (repeated) continue
+          }
           this.log({ kind: 'error', title: `写入失败：${describeOp(op)}`, detail: e.message })
           continue
         }
@@ -712,38 +855,72 @@ export class SyncEngine {
     }
   }
 
-  /** 重写页面顶部的同步区：删除旧 callout，在页面最前面追加新的（超过 100 个子块时分批） */
+  /**
+   * 重写页面顶部的同步区：先在页面最前面写入新的 callout（超过 100 个子块时分批），再删除旧的。
+   * 写入失败时旧内容还在；任何一步出错都把本地记录标为“不确定”，下次写入前先清理页面上所有同步区。
+   */
   private async applyBody(op: Extract<TaskOp, { kind: 'body' }>, state: WorkspaceState): Promise<number> {
     const link = state.tasks[op.didaId]
     const pageId = op.pageId ?? link?.pageId
     if (!link || !pageId || link.pageId !== pageId) return 0
     const { notion } = this.deps
     let writes = 0
-    if (link.body?.blockId) {
-      await notion.deleteBlock(link.body.blockId)
-      writes++
-    } else if (!link.body) {
-      // 第一次写（或本地状态丢失）：先清理页面上已有的同步区，避免出现两个
-      for (const b of await notion.listBlocks(pageId)) {
-        if (b.type === 'callout' && isSyncCallout(b)) {
-          await notion.deleteBlock(b.id)
+    try {
+      // 要删除的旧同步区：已知块 ID；第一次写或本地记录不确定时，扫描页面上所有同步区
+      const stale = link.body?.blockId
+        ? [link.body.blockId]
+        : link.body
+          ? []
+          : (await notion.listBlocks(pageId)).filter((b) => b.type === 'callout' && isSyncCallout(b)).map((b) => b.id)
+      let blockId: string | null = null
+      if (op.spec) {
+        const res = await notion.appendBlocks(pageId, [containerBlock(op.spec.blocks)], { type: 'page_start' })
+        writes++
+        blockId = res.results[0]?.id ?? null
+        for (let i = 100; blockId && i < op.spec.blocks.length; i += 100) {
+          await notion.appendBlocks(blockId, op.spec.blocks.slice(i, i + 100))
           writes++
         }
       }
-    }
-    let blockId: string | null = null
-    if (op.spec) {
-      const res = await notion.appendBlocks(pageId, [containerBlock(op.spec.blocks)], { type: 'page_start' })
-      writes++
-      blockId = res.results[0]?.id ?? null
-      for (let i = 100; blockId && i < op.spec.blocks.length; i += 100) {
-        await notion.appendBlocks(blockId, op.spec.blocks.slice(i, i + 100))
+      for (const id of stale) {
+        await notion.deleteBlock(id)
         writes++
       }
+      link.body = { blockId, hash: op.spec?.hash ?? null }
+      if (op.history) link.history = op.history
+      return writes
+    } catch (e) {
+      link.body = undefined
+      throw e
     }
-    link.body = { blockId, hash: op.spec?.hash ?? null }
-    if (op.history) link.history = op.history
-    return writes
+  }
+
+  /** 写入失败后确认页面是否已在 Notion 中删除（进了回收站或不存在）；是的话按“Notion 中已删除”处理 */
+  private async handleGonePage(op: TaskOp, state: WorkspaceState): Promise<boolean> {
+    const pageId =
+      op.kind === 'update' || op.kind === 'trash' || op.kind === 'abandon'
+        ? op.pageId
+        : op.kind === 'body'
+          ? (op.pageId ?? state.tasks[op.didaId]?.pageId)
+          : null
+    if (!pageId) return false
+    let page: NotionPage | null
+    try {
+      page = await this.deps.notion.getPage(pageId)
+    } catch {
+      return false
+    }
+    if (page && !page.in_trash && !page.archived) return false
+    if (op.kind === 'trash' || op.kind === 'abandon') {
+      delete state.tasks[op.didaId]
+      return true
+    }
+    if (op.kind !== 'update' && op.kind !== 'body') return false
+    const title = op.kind === 'update' ? op.desired.title : op.title
+    if (state.tasks[op.didaId]?.pageId === pageId) delete state.tasks[op.didaId]
+    state.notionRemoved[op.didaId] = { pageId, title, at: this.now().toISOString() }
+    this.log({ kind: 'removed', title: `Notion 中已删除，不再同步「${title}」`, didaId: op.didaId, pageId })
+    return true
   }
 
   private async applyUpdate(
@@ -915,6 +1092,35 @@ function countFocus(ops: FocusOp[]): RoundSummary['focus'] {
     updates: ops.filter((o) => o.kind === 'focusUpdate').length,
     trashes: ops.filter((o) => o.kind === 'focusTrash').length
   }
+}
+
+function failureKey(op: TaskOp): string | null {
+  if (op.kind === 'create') return `create:${op.desired.didaId}`
+  if (op.kind === 'update' || op.kind === 'body' || op.kind === 'trash' || op.kind === 'abandon') return `${op.kind}:${op.didaId}`
+  return null
+}
+
+function fingerprint(op: TaskOp): string {
+  switch (op.kind) {
+    case 'create':
+      return JSON.stringify(op.desired)
+    case 'update':
+      return JSON.stringify([op.pageId, op.patch])
+    case 'body':
+      return op.spec?.hash ?? 'remove'
+    case 'trash':
+    case 'abandon':
+      return op.pageId
+    default:
+      return ''
+  }
+}
+
+const UNLINK_TEXT: Record<Extract<TaskOp, { kind: 'unlink' }>['reason'], string> = {
+  out_of_scope: '任务移出同步范围',
+  deleted: '滴答中已删除',
+  archived: '清单已归档',
+  list_deleted: '清单已在滴答删除'
 }
 
 function isSyncCallout(block: Record<string, unknown>): boolean {

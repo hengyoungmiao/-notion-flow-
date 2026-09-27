@@ -54,6 +54,8 @@ export class AppTray {
             label: w.name,
             type: 'radio' as const,
             checked: w.id === state.activeWorkspaceId,
+            // 还没完成首次同步的空间不能直接切换（需要先在主界面完成设置）
+            enabled: w.initialized || w.id === state.activeWorkspaceId,
             click: () => this.actions.switchWorkspace(w.id)
           }))
         },

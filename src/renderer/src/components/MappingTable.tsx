@@ -13,7 +13,9 @@ const STATUS: Record<DomainRow['status'], { text: string; color: string }> = {
   excluded: { text: '不同步', color: 'default' },
   skip: { text: '不绑定', color: 'default' },
   none: { text: '不绑定', color: 'default' },
-  broken: { text: '已失效', color: 'red' }
+  broken: { text: '已失效', color: 'red' },
+  archived: { text: '已归档', color: 'default' },
+  deleted: { text: '已删除', color: 'default' }
 }
 
 interface TreeRow extends DomainRow {
@@ -120,6 +122,7 @@ export function MappingTable({ workspaceId, compact }: { workspaceId: string; co
                 <Select
                   size="small"
                   style={{ width: '100%' }}
+                  disabled={row.status === 'archived' || row.status === 'deleted'}
                   value={currentValue(row)}
                   onChange={(v) => void change(row, v)}
                   showSearch
@@ -140,7 +143,11 @@ export function MappingTable({ workspaceId, compact }: { workspaceId: string; co
             render: (_: unknown, row) => (
               <Space>
                 <Tag color={STATUS[row.status].color}>{STATUS[row.status].text}</Tag>
-                {row.notionTitle && row.status !== 'excluded' && <Typography.Text type="secondary">{row.notionTitle}</Typography.Text>}
+                {row.notionTitle && row.status !== 'excluded' && (
+                  <Typography.Text type="secondary">
+                    {row.status === 'archived' || row.status === 'deleted' ? `原来对应「${row.notionTitle}」` : row.notionTitle}
+                  </Typography.Text>
+                )}
               </Space>
             )
           }
