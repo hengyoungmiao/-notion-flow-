@@ -1,0 +1,50 @@
+{
+  "name": "flowsync",
+  "productName": "FlowSync",
+  "version": "0.1.0",
+  "description": "滴答清单 → Notion FLO.W 单向任务同步（Windows 桌面应用）",
+  "license": "MIT",
+  "private": true,
+  "main": "./out/main/index.js",
+  "author": "FlowSync",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:demo": "cross-env FLOWSYNC_FAKE=1 electron-vite dev",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "build:win": "electron-vite build && electron-builder --win --x64 --publish never",
+    "build:linux": "electron-vite build && electron-builder --linux dir --publish never"
+  },
+  "dependencies": {
+    "@suibiji/dida-cli": "0.1.14"
+  },
+  "devDependencies": {
+    "@ant-design/icons": "^6.3.4",
+    "@playwright/test": "^1.63.0",
+    "@types/luxon": "^3.7.5",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "antd": "^6.6.5",
+    "cross-env": "^10.0.0",
+    "dayjs": "^1.11.23",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "luxon": "^3.7.2",
+    "ntn": "0.23.10",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^5.0.2",
+    "zod": "^4.6.5"
+  }
+}

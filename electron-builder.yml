@@ -1,0 +1,54 @@
+appId: com.flowsync.app
+productName: FlowSync
+copyright: Copyright © 2026 FlowSync
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+# dida-cli 需要在 asar 之外，才能用 ELECTRON_RUN_AS_NODE 直接运行
+asarUnpack:
+  - node_modules/**
+# 注意：平台级 extraResources 会覆盖全局配置，所以托盘图标在每个平台里分别列出
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: resources/icon.png
+  extraResources:
+    - from: resources
+      to: resources
+      filter:
+        - '*.png'
+    - from: node_modules/ntn/dist/ntn-win32-x64/ntn.exe
+      to: bin/ntn.exe
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: FlowSync
+  artifactName: FlowSync-Setup-${version}.exe
+  deleteAppDataOnUninstall: false
+linux:
+  target: [dir]
+  category: Utility
+  extraResources:
+    - from: resources
+      to: resources
+      filter:
+        - '*.png'
+    - from: node_modules/ntn/dist/ntn-linux-x64/ntn
+      to: bin/ntn
+mac:
+  target: [dir]
+  extraResources:
+    - from: resources
+      to: resources
+      filter:
+        - '*.png'
+    - from: node_modules/ntn/dist/ntn-darwin-${arch}/ntn
+      to: bin/ntn

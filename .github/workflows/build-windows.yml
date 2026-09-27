@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-linux:
+    name: 测试（Linux）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: 安装 Electron 运行依赖
+        run: sudo apt-get update && sudo apt-get install -y xvfb libnss3 libgbm1 libasound2t64 libgtk-3-0 libatk-bridge2.0-0
+      - name: 界面测试（演示模式）
+        run: xvfb-run -a npx playwright test test/e2e/app.spec.ts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots
+          path: e2e-screenshots/
+          if-no-files-found: ignore
+
+  build-windows:
+    name: 构建 Windows 安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: 单元测试 + CLI 契约测试（Windows）
+        run: npm test
+      - name: 打包
+        run: npm run build:win
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: 冒烟测试：内置 ntn.exe 与 dida-cli
+        run: node scripts/smoke-packaged.mjs release/win-unpacked
+      - name: 冒烟测试：打包后的应用能找到内置 CLI
+        run: npx playwright test test/e2e/packaged.spec.ts
+        env:
+          FLOWSYNC_PACKAGED_APP: ${{ github.workspace }}\release\win-unpacked\FlowSync.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FlowSync-Windows
+          path: release/*.exe
+          if-no-files-found: error
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.exe
