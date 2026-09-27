@@ -599,7 +599,13 @@ export class AppController implements FlowSyncApi {
   }
 
   async openExternal(url: string): Promise<void> {
-    if (/^https:\/\//i.test(url)) await this.hooks.openExternal(url)
+    if (!/^https:\/\//i.test(url)) return
+    if (this.hooks.demo) {
+      // 演示数据里的链接都是假的，不启动浏览器
+      this.activity.push({ kind: 'info', title: '演示模式：不会打开外部链接', detail: url })
+      return
+    }
+    await this.hooks.openExternal(url)
   }
 
   async openPath(kind: 'logs' | 'backups' | 'data'): Promise<void> {
