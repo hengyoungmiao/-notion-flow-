@@ -99,8 +99,8 @@ export function newWorkspace(name: string): WorkspaceProfile {
 export class ConfigStore {
   private config: AppConfig = defaultConfig()
   private listeners = new Set<(c: AppConfig) => void>()
-  /** 启动时配置文件损坏、已从备份恢复 */
-  recovered = false
+  /** 启动时配置文件损坏：已从备份恢复（backup），或没有备份、改用默认配置（default） */
+  recovered: 'backup' | 'default' | null = null
 
   constructor(readonly rootDir: string) {}
 
@@ -138,7 +138,7 @@ export class ConfigStore {
     // 配置文件损坏：改用最近一次成功保存的备份
     if (first.corrupt) {
       raw = (await readJsonOrQuarantine<Partial<AppConfig>>(this.backupPath)).data
-      this.recovered = true
+      this.recovered = raw ? 'backup' : 'default'
     }
     const base = defaultConfig()
     this.config = raw

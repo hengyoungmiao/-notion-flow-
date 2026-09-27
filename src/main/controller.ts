@@ -124,7 +124,11 @@ export class AppController implements FlowSyncApi {
     void this.didaCheck()
     await this.upgradeSchemas()
     if (this.config.recovered)
-      this.activity.push({ kind: 'warning', title: '配置文件损坏，已从最近一次保存的备份恢复', detail: '损坏的文件已改名保留在数据目录' })
+      this.activity.push({
+        kind: 'warning',
+        title: this.config.recovered === 'backup' ? '配置文件损坏，已从最近一次保存的备份恢复' : '配置文件损坏且没有备份，已改用默认配置',
+        detail: '损坏的文件已改名保留在数据目录'
+      })
     if (c.onboarded) this.scheduler.start()
   }
 

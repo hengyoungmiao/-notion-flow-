@@ -100,7 +100,7 @@ describe('本地文件', () => {
     writeFileSync(join(dir, 'config.json'), '{"version":1,"workspa')
     const reloaded = new ConfigStore(dir)
     const config = await reloaded.load()
-    expect(reloaded.recovered).toBe(true)
+    expect(reloaded.recovered).toBe('backup')
     expect(config.onboarded).toBe(true)
     expect(config.settings.deletePolicy).toBe('abandon')
   })
