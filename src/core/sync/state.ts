@@ -39,10 +39,11 @@ export async function renameWithRetry(
 }
 
 /** 原子写 JSON：先写临时文件再 rename，避免崩溃时留下半个文件 */
-export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+export async function writeJsonAtomic(path: string, data: unknown, mode?: number): Promise<void> {
   await mkdir(dirname(path), { recursive: true })
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tmp, JSON.stringify(data, null, 2), 'utf8')
+  // 同一毫秒内的多次写入也不能共用临时文件
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`
+  await writeFile(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode })
   try {
     await renameWithRetry(tmp, path)
   } catch (e) {

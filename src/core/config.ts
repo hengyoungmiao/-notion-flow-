@@ -163,8 +163,9 @@ export class ConfigStore {
     mutator(next)
     next.settings = sanitizeSettings(next.settings)
     this.config = next
-    await writeJsonAtomic(this.path, next)
-    await writeJsonAtomic(this.backupPath, next).catch(() => undefined)
+    // 配置里可能有 Notion 集成 token：只允许本人读写
+    await writeJsonAtomic(this.path, next, 0o600)
+    await writeJsonAtomic(this.backupPath, next, 0o600).catch(() => undefined)
     const snapshot = this.get()
     for (const l of this.listeners) l(snapshot)
     return snapshot

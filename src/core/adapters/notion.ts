@@ -66,6 +66,8 @@ export function ntnEnv(cmd: Pick<NtnCommand, 'notionHome' | 'token' | 'env'>): R
   const env: Record<string, string> = {
     NOTION_HOME: cmd.notionHome,
     NOTION_API_VERSION,
+    // 服务器上没有系统钥匙串：ntn 登录凭据改存到 NOTION_HOME 下的文件
+    ...(process.platform === 'linux' ? { NOTION_KEYRING: '0' } : {}),
     ...cmd.env
   }
   if (cmd.token) env.NOTION_API_TOKEN = cmd.token

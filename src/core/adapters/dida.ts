@@ -16,6 +16,8 @@ export interface DidaReader {
   getTask(projectId: string, taskId: string): Promise<DidaTask | null>
   /** 收件箱未完成任务；接口不支持时返回 null */
   listInboxTasks(): Promise<DidaTask[] | null>
+  /** 单个清单的未完成任务（官方接口 project data，用作 task filter 的替代） */
+  listProjectTasks(projectId: string): Promise<DidaTask[]>
   listTags(): Promise<DidaTag[]>
   /** 专注记录（接口单次最多 30 天，调用方负责分段） */
   listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]>
@@ -140,6 +142,11 @@ export class DidaCliReader implements DidaReader {
     }
   }
 
+  async listProjectTasks(projectId: string): Promise<DidaTask[]> {
+    const data = await this.run<{ tasks?: DidaTask[] }>(['project', 'data', projectId])
+    return (data?.tasks ?? []).filter((t) => (t.status ?? 0) === 0)
+  }
+
   listTags(): Promise<DidaTag[]> {
     return this.run<DidaTag[]>(['tag', 'list']).then((r) => (Array.isArray(r) ? r : []))
   }
@@ -160,10 +167,10 @@ export class DidaCliReader implements DidaReader {
     }
   }
 
-  /** 用一次真实读取验证登录是否有效（`dida auth status` 只检查本地是否存在 token） */
+  /** 用一次真实读取验证登录是否有效（官方接口 project list；`dida auth status` 只检查本地是否存在 token） */
   async verifyAuth(): Promise<boolean> {
     try {
-      await this.getPreference()
+      await this.listProjects()
       return true
     } catch (e) {
       if (e instanceof CliError && e.kind === 'auth') return false

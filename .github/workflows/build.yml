@@ -1,0 +1,111 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '同时发布 GitHub Release（版本号取 package.json，自动创建 v 标签）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: 单元测试 + CLI 契约测试
+        run: npm test
+
+  package:
+    name: 打包 Linux ${{ matrix.arch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: node scripts/package.mjs --arch ${{ matrix.arch }}
+      - name: 冒烟测试：用安装脚本装好后运行演示（x64）
+        if: matrix.arch == 'x64'
+        run: |
+          export HOME="$(mktemp -d)"
+          FLOWSYNC_TARBALL="$GITHUB_WORKSPACE/release/flowsync-linux-x64.tar.gz" FLOWSYNC_NO_SYSTEMD=1 bash scripts/install.sh
+          F="$HOME/.local/bin/flowsync"
+          env -i PATH=/usr/bin:/bin HOME="$HOME" "$F" --version
+          env -i PATH=/usr/bin:/bin HOME="$HOME" "$F" doctor --fake
+          env -i PATH=/usr/bin:/bin HOME="$HOME" timeout 180 "$F" demo --rounds 2 --home "$HOME/demo" | tee demo.log
+          grep -q '首次同步完成' demo.log
+          # 真实模式（未登录）也能跑检查：内置的 ntn、dida-cli 都能启动
+          env -i PATH=/usr/bin:/bin HOME="$HOME" "$F" doctor | tee doctor.log || true
+          grep -q 'Notion CLI（ntn）：0.23' doctor.log
+          grep -q '滴答 CLI（dida-cli）：0.1' doctor.log
+      - name: 检查 arm64 包内的二进制架构
+        if: matrix.arch == 'arm64'
+        run: |
+          file release/stage-arm64/flowsync/node/bin/node | grep -q aarch64
+          file release/stage-arm64/flowsync/app/node_modules/ntn/dist/ntn-linux-arm64/ntn | grep -q aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flowsync-linux-${{ matrix.arch }}
+          path: release/flowsync-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 发布 Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+      - name: 读取版本号
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-release/*.tar.gz
+            scripts/install.sh
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          target_commitish: ${{ github.sha }}
+          name: FlowSync v${{ steps.version.outputs.version }}（Linux 后台服务）
+          make_latest: true
+          body: |
+            在 Linux 服务器（例如 Google Cloud 免费的 e2-micro，Debian / Ubuntu）上用普通用户运行：
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
+            flowsync setup
+            sudo systemctl enable --now flowsync
+            flowsync doctor
+            ```
+
+            - `flowsync-linux-x64.tar.gz`：x86_64（Google Cloud e2-micro 就是这个）
+            - `flowsync-linux-arm64.tar.gz`：ARM64
+            - 发布包自带 Node 运行时、滴答 CLI（dida-cli）和 Notion CLI（ntn），不需要另外安装。
+
+            详细说明见仓库 README。

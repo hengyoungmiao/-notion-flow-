@@ -33,10 +33,14 @@ export class FakeDida implements DidaReader {
   hiddenProjects: DidaProject[] = []
   /** 模拟 project get 对某些清单报错 */
   projectErrors = new Map<string, CliError>()
+  /** 模拟某些接口不可用：键为调用名（preference、open、completed、tags、focus:pomodoro、groups…） */
+  failEndpoints = new Map<string, CliError>()
 
   private check(name: string): void {
     this.calls.push(name)
     if (this.failWith) throw this.failWith
+    const e = this.failEndpoints.get(name)
+    if (e) throw e
   }
 
   addTask(t: Partial<DidaTask> & { id?: string; projectId: string }): DidaTask {
@@ -140,6 +144,11 @@ export class FakeDida implements DidaReader {
     this.check('focus:get')
     const f = this.focus.get(focusId)
     return f ? structuredClone(f) : null
+  }
+
+  async listProjectTasks(projectId: string): Promise<DidaTask[]> {
+    this.check('projectData')
+    return [...this.tasks.values()].filter((t) => t.projectId === projectId && (t.status ?? 0) === 0).map((t) => structuredClone(t))
   }
 
   async listInboxTasks(): Promise<DidaTask[] | null> {

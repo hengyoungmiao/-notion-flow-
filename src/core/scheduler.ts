@@ -40,6 +40,8 @@ export interface SchedulerDeps {
   settings: () => AppSettings
   onChange?: (s: SchedulerSnapshot) => void
   onError?: (e: unknown) => void
+  /** 每一轮结束后（成功或失败）调用 */
+  afterRound?: (result: RoundResult | null) => void
   now?: () => Date
 }
 
@@ -218,10 +220,13 @@ export class Scheduler {
       }
     })()
     this.running = run
+    let outcome: RoundResult | null = null
     try {
-      return await run
+      outcome = await run
+      return outcome
     } finally {
       this.running = null
+      this.deps.afterRound?.(outcome)
       if (this.queued) {
         const next = this.queued
         this.queued = null
