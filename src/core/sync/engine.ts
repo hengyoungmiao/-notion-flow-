@@ -20,7 +20,7 @@ import { plainText, toRichText } from '../mapping/text'
 import { buildFocusProperties, focusPageStartKey } from '../mapping/focus'
 import { BODY_TITLE, containerBlock } from '../mapping/body'
 import { missingInWindow, planFocus, type FocusOp } from './focus'
-import { trackLists, type ListTracking } from './lists'
+import { probeCandidates, trackLists, type ListTracking, type ProbeResult } from './lists'
 import type {
   AppSettings,
   DesiredTask,
@@ -261,6 +261,7 @@ export class SyncEngine {
         !seen.has(l.didaId) &&
         l.written.statusGroup === 'open' &&
         !tracking.archived.has(l.projectId) &&
+        !tracking.pending.has(l.projectId) &&
         !tracking.deleted.has(l.projectId)
     )
     if (missing.length === 0) return result
@@ -283,8 +284,11 @@ export class SyncEngine {
     return result
   }
 
-  /** 清单的归档/删除情况（检测日期按滴答时区的本地日期） */
-  private trackLists(state: WorkspaceState, structure: Structure, zone: string): ListTracking {
+  /**
+   * 清单的归档/删除情况（检测日期按滴答时区的本地日期）。
+   * 从清单列表里消失的清单先用 `project get` 确认：查得到算归档（不做任何同步），查不到才算删除。
+   */
+  private async trackLists(state: WorkspaceState, structure: Structure, zone: string): Promise<ListTracking> {
     const known = new Set<string>()
     const names: Record<string, string> = {}
     for (const [id, link] of Object.entries(state.domains.lists)) {
@@ -292,7 +296,17 @@ export class SyncEngine {
       names[id] = link.lastName
     }
     for (const link of Object.values(state.tasks)) if (!isInbox(link.projectId)) known.add(link.projectId)
-    return trackLists({ prev: state.lists, projects: structure.projects, knownProjectIds: known, names, now: this.now(), zone })
+    const now = this.now()
+    const probes = new Map<string, ProbeResult>()
+    for (const id of probeCandidates({ prev: state.lists, projects: structure.projects, knownProjectIds: known, now })) {
+      try {
+        probes.set(id, await this.deps.dida.getProject(id))
+      } catch (e) {
+        if (e instanceof CliError && e.kind === 'auth') throw e
+        probes.set(id, 'error')
+      }
+    }
+    return trackLists({ prev: state.lists, projects: structure.projects, knownProjectIds: known, names, probes, now, zone })
   }
 
   private zoneOf(structure: Structure): string {
@@ -325,7 +339,13 @@ export class SyncEngine {
   }
 
   /** 读取专注记录（番茄钟 + 正计时），并确认窗口内缺席的记录是否已删除 */
-  private async loadFocus(state: WorkspaceState, now: Date, initial: boolean, force: boolean): Promise<FocusLoad | null> {
+  private async loadFocus(
+    state: WorkspaceState,
+    now: Date,
+    initial: boolean,
+    force: boolean,
+    frozen: (taskDidaId: string) => boolean
+  ): Promise<FocusLoad | null> {
     const { dida, settings } = this.deps
     if (!this.schema.focus || !settings.syncFocus) return null
     if (!initial && !force && state.focus.cursor && now.getTime() - this.lastFocusAt < FOCUS_INTERVAL_MS) return null
@@ -340,7 +360,7 @@ export class SyncEngine {
           : []
       const seen = new Set(records.map((r) => r.id))
       const confirmations = new Map<string, DidaFocus | null>()
-      for (const link of missingInWindow(state, seen, from, now).slice(0, 30))
+      for (const link of missingInWindow(state, seen, from, now).filter((l) => !frozen(l.taskDidaId)).slice(0, 30))
         confirmations.set(link.focusId, await dida.getFocus(link.focusId, link.kind))
       this.lastFocusAt = now.getTime()
       return { records, confirmations, from, to: now }
@@ -365,7 +385,7 @@ export class SyncEngine {
     const schema = this.schema
     const state = await this.deps.store.load(this.deps.profile.id)
     const structure = await this.loadStructure(force)
-    const tracking = this.trackLists(state, structure, this.zoneOf(structure))
+    const tracking = await this.trackLists(state, structure, this.zoneOf(structure))
     const plan = planDomains({
       projects: structure.projects,
       groups: structure.groups,
@@ -414,7 +434,7 @@ export class SyncEngine {
       throw new CliError('滴答清单返回的清单列表为空，本轮跳过（避免误删），稍后自动重试', 'dida', 'server')
     }
     const zone = this.zoneOf(structure)
-    const tracking = this.trackLists(state, structure, zone)
+    const tracking = await this.trackLists(state, structure, zone)
     const domainPlan = planDomains({
       projects: structure.projects,
       groups: structure.groups,
@@ -468,13 +488,19 @@ export class SyncEngine {
       pageChecks,
       candidates,
       projects: structure.flowProjects,
-      lists: { archived: tracking.archived, deleted: tracking.deleted },
+      // 已归档、以及还没确认是归档还是删除的清单：其中的任务这一轮都不动
+      lists: { archived: new Set([...tracking.archived.keys(), ...tracking.pending]), deleted: tracking.deleted },
       initial,
       now
     })
     const warnings = [...structure.schemaIssues, ...domainPlan.warnings, ...plan.warnings]
     const summary = summarize(plan.ops, domainPlan, warnings)
-    const focusLoad = await this.loadFocus(state, now, initial, !!opts.forceReconcile)
+    // 归档清单（以及还没确认的清单）里的任务：番茄记录也不动
+    const frozen = (didaId: string) => {
+      const link = state.tasks[didaId]
+      return !!link && (tracking.archived.has(link.projectId) || tracking.pending.has(link.projectId))
+    }
+    const focusLoad = await this.loadFocus(state, now, initial, !!opts.forceReconcile, frozen)
 
     let ops = plan.ops
     let blocked: PendingApproval | null = null
@@ -499,6 +525,7 @@ export class SyncEngine {
           records: focusLoad.records,
           state,
           taskFor: (id) => {
+            if (frozen(id)) return null
             const link = state.tasks[id]
             if (link) return { pageId: link.pageId, title: link.written.title }
             return planned.has(id) ? { pageId: 'pending', title: planned.get(id)! } : null
@@ -545,6 +572,7 @@ export class SyncEngine {
           records: focusLoad.records,
           state,
           taskFor: (id) => {
+            if (frozen(id)) return null
             const link = state.tasks[id]
             return link ? { pageId: link.pageId, title: link.written.title } : null
           },
@@ -599,13 +627,8 @@ export class SyncEngine {
     state.lists = tracking.lists
     for (const id of tracking.expired) delete state.domains.lists[id]
     for (const e of tracking.events) {
-      if (e.kind === 'archived')
-        this.log({
-          kind: 'domain',
-          title: `清单「${e.name}」已归档`,
-          detail: this.deps.settings.archivedListsComplete ? '其中未完成的任务会在 Notion 标记完成' : '其中的任务已解除关联'
-        })
-      else if (e.kind === 'reopened') this.log({ kind: 'domain', title: `清单「${e.name}」已重新打开，恢复按滴答状态同步` })
+      if (e.kind === 'archived') this.log({ kind: 'domain', title: `清单「${e.name}」已归档，其中的任务不再同步（Notion 保持原样）` })
+      else if (e.kind === 'reopened') this.log({ kind: 'domain', title: `清单「${e.name}」已重新打开，恢复同步` })
       else this.log({ kind: 'domain', title: `清单「${e.name}」已在滴答删除`, detail: '其中的任务按「删除任务」设置处理' })
     }
   }
@@ -769,13 +792,8 @@ export class SyncEngine {
           case 'update': {
             const desired = this.resolved(op.desired, state)
             await this.applyUpdate(desired, op.pageId, op.actual ?? null, state, writes, op.patch)
-            const kind = op.reason === 'drift' ? 'correct' : op.reason === 'dida' || op.reason === 'archived' ? 'update' : 'relink'
-            const title =
-              op.reason === 'drift'
-                ? `已按滴答校正「${desired.title}」`
-                : op.reason === 'archived'
-                  ? `清单已归档，任务标记完成「${desired.title}」`
-                  : desired.title
+            const kind = op.reason === 'drift' ? 'correct' : op.reason === 'dida' ? 'update' : 'relink'
+            const title = op.reason === 'drift' ? `已按滴答校正「${desired.title}」` : desired.title
             this.log({ kind, title, detail: patchFields(op.patch).join('、'), didaId: desired.didaId, pageId: op.pageId })
             break
           }
@@ -1119,7 +1137,6 @@ function fingerprint(op: TaskOp): string {
 const UNLINK_TEXT: Record<Extract<TaskOp, { kind: 'unlink' }>['reason'], string> = {
   out_of_scope: '任务移出同步范围',
   deleted: '滴答中已删除',
-  archived: '清单已归档',
   list_deleted: '清单已在滴答删除'
 }
 

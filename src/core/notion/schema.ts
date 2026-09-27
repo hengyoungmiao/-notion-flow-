@@ -1,4 +1,5 @@
 import type { FlowSchema, NotionDataSource, NotionPropertySchema, StatusGroup } from '../types'
+import { safeDecode } from '../mapping/task'
 import { plainText } from '../mapping/text'
 
 export const DIDA_ID_PROPERTY = '滴答ID'
@@ -102,25 +103,40 @@ const OPTIONAL_PROPS = { completedAt: '完成日期', domain: '二级领域', ta
  * 可选字段被删除时停止写入，必需字段被删除时给出明确错误；之前没绑定上的可选字段按名称补上。
  */
 export function refreshTaskSchema(current: FlowSchema, ds: NotionDataSource): SchemaRefresh {
-  const byId = new Map(props(ds).map((p) => [p.id, p]))
+  // 属性 ID 统一解码后比较（新建字段时 PATCH 响应和 GET 响应的编码形式可能不同），找到后改用数据源里的原样写法
+  const byId = new Map(props(ds).map((p) => [safeDecode(p.id), p]))
+  const find = (id: string | null | undefined) => (id ? byId.get(safeDecode(id)) : undefined)
   const bound = bindTaskSchema(ds)
   const p = current.tasks.props
-  for (const [key, name] of Object.entries(REQUIRED_PROPS) as Array<[keyof typeof REQUIRED_PROPS, string]>) {
-    if (!p[key] || !byId.has(p[key]))
-      return { schema: current, issues: [], fatal: `任务库的「${name}」字段已被删除或更改，请在 Notion 中恢复，或到「工作空间」重新识别任务库`, changed: false }
-  }
   const issues: string[] = []
   const next = { ...p }
+  for (const [key, name] of Object.entries(REQUIRED_PROPS) as Array<[keyof typeof REQUIRED_PROPS, string]>) {
+    const found = find(p[key])
+    if (found) {
+      next[key] = found.id
+      continue
+    }
+    // 按 ID 找不到：先按名称和类型重新识别（例如字段删掉后又新建了同名的）
+    const rebound = bound.tasks.props[key]
+    if (!rebound)
+      return { schema: current, issues: [], fatal: `任务库的「${name}」字段已被删除或更改，请在 Notion 中恢复，或到「工作空间」重新识别任务库`, changed: false }
+    next[key] = rebound
+    issues.push(`任务库的「${name}」字段已重新识别`)
+  }
   for (const [key, name] of Object.entries(OPTIONAL_PROPS) as Array<[keyof typeof OPTIONAL_PROPS, string]>) {
     const id = p[key] ?? null
-    if (id && byId.has(id)) continue
+    const found = find(id)
+    if (found) {
+      next[key] = found.id
+      continue
+    }
     next[key] = bound.tasks.props[key] ?? null
     if (id && !next[key] && key !== 'note') issues.push(`任务库的「${name}」字段已被删除，暂停同步这个字段`)
   }
-  const status = bindStatus(byId.get(p.status)!)
+  const status = bindStatus(find(next.status)!)
   if (!status) return { schema: current, issues: [], fatal: '任务库「状态」字段缺少可用的完成/未完成选项', changed: false }
   const taskTypeOptions = { schedule: null as string | null, todo: null as string | null }
-  for (const o of (next.taskType ? byId.get(next.taskType)?.select?.options : undefined) ?? []) {
+  for (const o of find(next.taskType)?.select?.options ?? []) {
     if (o.name === '日程') taskTypeOptions.schedule = o.id
     if (o.name === '待办') taskTypeOptions.todo = o.id
   }

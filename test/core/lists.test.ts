@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { CliError } from '../../src/core/adapters/exec'
 import { FLOW_IDS } from '../../src/core/adapters/fake'
-import { trackLists } from '../../src/core/sync/lists'
+import { probeCandidates, trackLists } from '../../src/core/sync/lists'
 import { advance, domainPages, makeWorld, pageByDidaId, prop, taskPages, titleOf, type World } from './helpers'
 
 const S = FLOW_IDS.status
@@ -20,90 +21,77 @@ const removeProject = (w: World, id: string) => {
   w.dida.projects = w.dida.projects.filter((p) => p.id !== id)
 }
 const status = (w: World, didaId: string) => prop(pageByDidaId(w, didaId)!, '状态')?.status?.id
-const doneDate = (w: World, didaId: string) => prop(pageByDidaId(w, didaId)!, '完成日期')?.date?.start ?? null
 const logTitles = (w: World) => w.logs.map((l) => l.title)
 
-describe('清单归档', () => {
+describe('清单归档：不触发任何同步动作', () => {
   const seed = (w: World) => {
-    w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口' })
-    w.dida.addTask({ id: 't2', projectId: 'p-dev', title: '已完成的', timeZone: 'Asia/Shanghai' })
+    w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口', content: '接口说明' })
+    w.dida.addTask({ id: 't2', projectId: 'p-dev', title: '写文档' })
     w.dida.addTask({ id: 't3', projectId: 'p-read', title: '读书' })
   }
-  /** t2 在归档前已经在滴答完成（上海时间 09-27 17:00） */
-  const completeT2 = async (w: World) => {
-    w.dida.updateTask('t2', { status: 2, completedTime: '2026-09-27T09:00:00.000+0000' })
-    await w.engine().runRound()
-    advance(w, 1)
-  }
+  const callouts = (w: World, didaId: string) => w.notion.blockTree(pageByDidaId(w, didaId)!.id).filter((b) => b.type === 'callout')
 
-  it('未完成任务标记完成（完成日期为检测日），已完成的保持原日期，二级领域不变，不调用滴答接口', async () => {
+  it('归档后对 Notion 零写入：不改状态、不删页面、不查滴答，链接保留', async () => {
     const w = await initialized(seed)
-    await completeT2(w)
-    const domainBefore = prop(pageByDidaId(w, 't1')!, '二级领域')?.relation
     setProject(w, 'p-dev', { closed: true })
-    advance(w, 60 * 20) // 2026-09-28 12:00（上海）
-    w.dida.addTask({ id: 't4', projectId: 'p-dev', title: '归档后完成', status: 2, completedTime: '2026-09-28T03:00:00.000+0000' })
+    // 归档清单里的变化（刚完成的、被删除的、新的番茄记录）都不处理
+    w.dida.updateTask('t2', { status: 2, completedTime: '2026-09-27T08:00:30.000+0000' })
+    w.dida.deleteTask('t1')
+    w.dida.addFocus({ id: 'f1', type: 0, taskId: 't2', startTime: '2026-09-27T07:30:00+0000', endTime: '2026-09-27T07:55:00+0000', duration: 1500 })
     w.dida.calls.length = 0
-    await w.engine().runRound()
-
-    expect(status(w, 't1')).toBe(S.done)
-    expect(doneDate(w, 't1')).toBe('2026-09-28')
-    expect(doneDate(w, 't2')).toBe('2026-09-27')
-    expect(status(w, 't3')).toBe(S.todo)
-    expect(prop(pageByDidaId(w, 't1')!, '二级领域')?.relation).toEqual(domainBefore)
-    expect(pageByDidaId(w, 't4')).toBeUndefined()
-    expect(w.dida.calls).not.toContain('get')
-    expect(logTitles(w)).toContain('清单「开发」已归档')
-    expect(logTitles(w)).toContain('清单已归档，任务标记完成「写接口」')
-
-    // 之后保持稳定，不再重复写入
-    advance(w, 1)
     w.notion.writes = 0
     await w.engine().runRound()
+
+    expect(w.notion.writes).toBe(0)
+    expect(w.notion.pagesOf(FLOW_IDS.focus)).toHaveLength(0)
+    expect(status(w, 't1')).toBe(S.todo)
+    expect(status(w, 't2')).toBe(S.todo)
+    expect(callouts(w, 't1')).toHaveLength(1)
+    expect(w.dida.calls).not.toContain('get')
+    const state = await w.store.load(w.profile.id)
+    expect(Object.keys(state.tasks).sort()).toEqual(['t1', 't2', 't3'])
+    expect(logTitles(w)).toContain('清单「开发」已归档，其中的任务不再同步（Notion 保持原样）')
+
+    advance(w, 11)
+    await w.engine().runRound({ forceReconcile: true })
     expect(w.notion.writes).toBe(0)
   })
 
-  it('熔断后隔天才确认，完成日期仍是检测到归档的那天', async () => {
-    const w = await initialized((w) => {
-      for (let i = 0; i < 12; i++) w.dida.addTask({ id: `t${i}`, projectId: 'p-dev', title: `任务${i}` })
-    })
-    setProject(w, 'p-dev', { closed: true })
-    const first = await w.engine().runRound()
-    expect(first.blocked?.sample).toContain('清单已归档，任务标记完成「任务0」')
-    expect(status(w, 't0')).toBe(S.todo)
-
-    advance(w, 60 * 24)
-    const approved = await w.engine().runRound({ approve: true })
-    expect(approved.blocked).toBeNull()
-    expect(taskPages(w).every((p) => prop(p, '完成日期')?.date?.start === '2026-09-27')).toBe(true)
-  })
-
-  it('清单重新打开：未完成的任务恢复为未完成，滴答里已完成的保持完成', async () => {
+  it('重新打开后恢复同步', async () => {
     const w = await initialized(seed)
-    await completeT2(w)
     setProject(w, 'p-dev', { closed: true })
     await w.engine().runRound()
-    expect(status(w, 't1')).toBe(S.done)
-
     advance(w, 10)
     setProject(w, 'p-dev', { closed: false })
+    w.dida.updateTask('t2', { title: '写文档（第二版）' })
     w.logs.length = 0
     await w.engine().runRound()
-    expect(status(w, 't1')).toBe(S.todo)
-    expect(doneDate(w, 't1')).toBeNull()
-    expect(status(w, 't2')).toBe(S.done)
-    expect(logTitles(w)).toContain('清单「开发」已重新打开，恢复按滴答状态同步')
+    expect(titleOf(pageByDidaId(w, 't2')!)).toBe('写文档（第二版）')
+    expect(logTitles(w)).toContain('清单「开发」已重新打开，恢复同步')
   })
 
-  it('关闭开关：只解除关联，页面保持原样，绝不移入回收站', async () => {
-    const w = await initialized(seed, { archivedListsComplete: false })
-    setProject(w, 'p-dev', { closed: true })
+  it('滴答的清单列表不返回已归档清单时：向滴答确认后按归档处理，不会误删', async () => {
+    const w = await initialized(seed)
+    const dev = w.dida.projects.find((p) => p.id === 'p-dev')!
+    removeProject(w, 'p-dev')
+    w.dida.hiddenProjects = [{ ...dev, closed: true }]
     w.dida.failGetForUnknownProject = true
+    w.notion.writes = 0
+    const res = await w.engine().runRound()
+    expect(res.blocked).toBeNull()
+    expect(w.notion.writes).toBe(0)
+    expect(taskPages(w)).toHaveLength(3)
+    expect(logTitles(w)).toContain('清单「开发」已归档，其中的任务不再同步（Notion 保持原样）')
+    const view = await w.engine().inspectStructure(true)
+    expect(view.rows.find((r) => r.didaId === 'p-dev')).toMatchObject({ status: 'archived' })
+  })
+
+  it('关闭同步区开关时，不清理归档清单里任务的同步区', async () => {
+    const w = await initialized(seed)
+    setProject(w, 'p-dev', { closed: true })
+    w.settings = { ...w.settings, syncBody: false }
     await w.engine().runRound()
-    expect(status(w, 't1')).toBe(S.todo)
-    expect(pageByDidaId(w, 't1')).toBeDefined()
-    expect((await w.store.load(w.profile.id)).tasks.t1).toBeUndefined()
-    expect(logTitles(w)).toContain('清单已归档，已解除关联「写接口」')
+    expect(callouts(w, 't1')).toHaveLength(1)
   })
 
   it('映射页显示为已归档，没有警告', async () => {
@@ -137,6 +125,48 @@ describe('清单被删除', () => {
     expect(pageByDidaId(w, 't3')).toBeDefined()
     expect(logTitles(w)).toContain('清单「开发」已在滴答删除')
     expect(logTitles(w)).toContain('清单已在滴答删除，Notion 页面移入回收站「写接口」')
+  })
+
+  it('向滴答确认清单时出错：这一轮不删除，下一轮确认后再处理；每个清单只确认一次', async () => {
+    const w = await initialized(seed)
+    deleteList(w, 'p-dev')
+    w.dida.projectErrors.set('p-dev', new CliError('DIDA API 错误 502: bad gateway', 'dida', 'server', 502))
+    await w.engine().runRound()
+    expect(taskPages(w)).toHaveLength(3)
+
+    w.dida.projectErrors.clear()
+    advance(w, 1)
+    await w.engine().runRound()
+    expect(pageByDidaId(w, 't1')).toBeUndefined()
+
+    w.dida.calls.length = 0
+    advance(w, 1)
+    await w.engine().runRound()
+    expect(w.dida.calls).not.toContain('getProject')
+  })
+
+  it('先归档、后删除：24 小时内不重复确认，之后确认已删除再按删除设置处理', async () => {
+    const w = await initialized(seed)
+    const dev = w.dida.projects.find((p) => p.id === 'p-dev')!
+    removeProject(w, 'p-dev')
+    w.dida.hiddenProjects = [{ ...dev, closed: true }]
+    await w.engine().runRound()
+    expect(taskPages(w)).toHaveLength(3)
+
+    // 归档的清单在滴答里被删除
+    w.dida.hiddenProjects = []
+    for (const t of [...w.dida.tasks.values()]) if (t.projectId === 'p-dev') w.dida.deleteTask(t.id)
+    advance(w, 60)
+    w.dida.calls.length = 0
+    await w.engine().runRound()
+    expect(w.dida.calls).not.toContain('getProject')
+    expect(taskPages(w)).toHaveLength(3)
+
+    advance(w, 60 * 24)
+    await w.engine().runRound()
+    expect(pageByDidaId(w, 't1')).toBeUndefined()
+    expect(pageByDidaId(w, 't3')).toBeDefined()
+    expect(logTitles(w)).toContain('清单「开发」已在滴答删除')
   })
 
   it('「标记放弃」策略下标记放弃', async () => {
@@ -249,9 +279,9 @@ describe('trackLists', () => {
   const base = { names: {}, zone: 'Asia/Shanghai' }
   const empty = { archived: {}, deleted: {} }
 
-  it('新归档按时区记录检测日期；重新打开和删除产生事件', () => {
+  it('新归档按时区记录检测日期；消失的清单确认后才算删除，没确认的先不动', () => {
     const now = new Date('2026-09-27T17:30:00Z') // 上海 09-28 01:30
-    const r = trackLists({
+    const input = {
       ...base,
       prev: { archived: { p2: { name: '旧', date: '2026-09-01', at: '2026-09-01T00:00:00Z' } }, deleted: {} },
       projects: [
@@ -259,18 +289,26 @@ describe('trackLists', () => {
         { id: 'p2', name: '旧', closed: false },
         { id: 'p3', name: '没用过的归档', closed: true }
       ],
-      knownProjectIds: ['p1', 'p2', 'p9', 'inbox1'],
+      knownProjectIds: ['p1', 'p2', 'p8', 'p9', 'inbox1'],
       names: { p9: '被删的' },
       now
-    })
+    }
+    expect(probeCandidates(input)).toEqual(['p8', 'p9'])
+    const r = trackLists({ ...input, probes: new Map([['p8', { id: 'p8', name: '隐藏的归档', closed: true }], ['p9', null]]) })
     expect(r.archived.get('p1')).toBe('2026-09-28')
+    expect(r.archived.get('p8')).toBe('2026-09-28')
     expect(r.archived.has('p3')).toBe(false)
     expect(r.deleted).toEqual(new Set(['p9']))
     expect(r.events).toEqual([
       { kind: 'archived', projectId: 'p1', name: '开发' },
       { kind: 'reopened', projectId: 'p2', name: '旧' },
+      { kind: 'archived', projectId: 'p8', name: '隐藏的归档' },
       { kind: 'deleted', projectId: 'p9', name: '被删的' }
     ])
+
+    const unconfirmed = trackLists({ ...input, probes: new Map([['p9', 'error']]) })
+    expect(unconfirmed.deleted.size).toBe(0)
+    expect(unconfirmed.pending).toEqual(new Set(['p8', 'p9']))
   })
 
   it('检测日期保持不变；已删除记录 30 天后过期；清单列表为空时不判定删除', () => {
@@ -287,5 +325,38 @@ describe('trackLists', () => {
     const glitch = trackLists({ ...base, prev: { ...empty, deleted: { p9: prev.deleted.p9 } }, projects: [], knownProjectIds: ['p1'], now: new Date('2026-08-02T00:00:00Z') })
     expect(glitch.deleted).toEqual(new Set(['p9']))
     expect(glitch.events).toEqual([])
+    expect(probeCandidates({ prev: empty, projects: [], knownProjectIds: ['p1'], now: new Date() })).toEqual([])
+  })
+
+  it('已归档但列表里没有的清单，24 小时内不重复确认', () => {
+    const prev = { archived: { p1: { name: '开发', date: '2026-09-01', at: '2026-09-01T00:00:00Z', checkedAt: '2026-09-27T00:00:00Z' } }, deleted: {} }
+    const input = { prev, projects: [{ id: 'p2', name: '别的' }], knownProjectIds: ['p1'] }
+    expect(probeCandidates({ ...input, now: new Date('2026-09-27T20:00:00Z') })).toEqual([])
+    expect(probeCandidates({ ...input, now: new Date('2026-09-28T01:00:00Z') })).toEqual(['p1'])
+  })
+})
+
+describe('planTasks：归档清单', () => {
+  it('即使拿到“查不到”的确认结果，也不删除归档清单里的任务', async () => {
+    const { planTasks } = await import('../../src/core/sync/planner')
+    const w = await initialized((w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口' }))
+    const state = await w.store.load(w.profile.id)
+    const result = planTasks({
+      state,
+      profile: w.profile,
+      schema: w.profile.schema!,
+      settings: w.settings,
+      userTimeZone: 'Asia/Shanghai',
+      domainPlan: { listMap: new Map(), scopeProjectIds: new Set(), ops: [], warnings: [], rows: [] },
+      tasks: [],
+      confirmations: new Map([['t1', null]]),
+      linkedPages: null,
+      pageChecks: new Map(),
+      candidates: null,
+      lists: { archived: new Set(['p-dev']), deleted: new Set() },
+      initial: false,
+      now: w.now.value
+    })
+    expect(result.ops).toEqual([])
   })
 })

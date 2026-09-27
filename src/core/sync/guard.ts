@@ -33,7 +33,7 @@ export function evaluateBreaker(
       (o) =>
         o.kind === 'trash' ||
         o.kind === 'abandon' ||
-        (o.kind === 'update' && !isLowRiskUpdate(o) && (o.reason === 'dida' || o.reason === 'drift' || o.reason === 'archived'))
+        (o.kind === 'update' && !isLowRiskUpdate(o) && (o.reason === 'dida' || o.reason === 'drift'))
     )
     .slice(0, 20)
     .map(describeOp)

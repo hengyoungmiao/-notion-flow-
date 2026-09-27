@@ -282,6 +282,22 @@ export function planDomains(input: DomainInput): DomainPlan {
       mode: link.mode
     })
   }
+  // 清单列表里没有、但向滴答确认过还在的归档清单
+  const listed = new Set(input.projects.map((p) => p.id))
+  for (const [projectId, entry] of Object.entries(input.state.lists?.archived ?? {})) {
+    const link = input.state.domains.lists[projectId]
+    if (listed.has(projectId) || !link) continue
+    rows.push({
+      type: 'list',
+      didaId: projectId,
+      didaName: entry.name,
+      groupId: null,
+      status: 'archived',
+      notionPageId: link.pageId,
+      notionTitle: domainTitle(link),
+      mode: link.mode
+    })
+  }
   for (const [projectId, entry] of Object.entries(input.state.lists?.deleted ?? {})) {
     const link = input.state.domains.lists[projectId]
     rows.push({

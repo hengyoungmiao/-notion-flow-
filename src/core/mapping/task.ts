@@ -122,7 +122,8 @@ export function propById(page: NotionPage, id: string | null): NotionPropertyVal
   return undefined
 }
 
-function safeDecode(s: string): string {
+/** 属性 ID 可能是 URL 编码形式（例如 `%3AUPp`），比较前统一解码 */
+export function safeDecode(s: string): string {
   try {
     return decodeURIComponent(s)
   } catch {

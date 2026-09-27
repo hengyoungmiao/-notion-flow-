@@ -121,8 +121,9 @@ describe('设置校验', () => {
     expect(s.breaker).toEqual({ maxTrash: 50, maxUpdateRatio: DEFAULT_SETTINGS.breaker.maxUpdateRatio, minUpdates: DEFAULT_SETTINGS.breaker.minUpdates })
   })
 
-  it('未知字段被丢弃，缺失字段补默认值', () => {
-    const s = sanitizeSettings({ foo: 1 })
+  it('未知字段被丢弃，缺失字段补默认值（包括已取消的旧设置）', () => {
+    const s = sanitizeSettings({ foo: 1, archivedListsComplete: true })
     expect(s).toEqual(DEFAULT_SETTINGS)
+    expect('archivedListsComplete' in s).toBe(false)
   })
 })

@@ -7,6 +7,8 @@ export interface DidaReader {
   getPreference(): Promise<DidaPreference>
   listProjects(): Promise<DidaProject[]>
   listGroups(): Promise<DidaGroup[]>
+  /** 单个清单（含已归档）；返回 null 表示 404（清单已删除） */
+  getProject(projectId: string): Promise<DidaProject | null>
   /** 未完成任务；不传 projectIds 时由服务端决定范围（是否含收件箱待样例校准） */
   listOpenTasks(projectIds?: string[]): Promise<DidaTask[]>
   listCompletedTasks(from: Date, to: Date, projectIds?: string[]): Promise<DidaTask[]>
@@ -94,6 +96,16 @@ export class DidaCliReader implements DidaReader {
 
   listGroups(): Promise<DidaGroup[]> {
     return this.run<DidaGroup[]>(['project', 'group', 'list']).then((r) => r ?? [])
+  }
+
+  async getProject(projectId: string): Promise<DidaProject | null> {
+    try {
+      const p = await this.run<DidaProject>(['project', 'get', projectId])
+      return p && p.id ? p : null
+    } catch (e) {
+      if (e instanceof CliError && e.kind === 'not_found') return null
+      throw e
+    }
   }
 
   listOpenTasks(projectIds?: string[]): Promise<DidaTask[]> {

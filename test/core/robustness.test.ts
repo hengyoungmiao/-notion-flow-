@@ -53,6 +53,58 @@ describe('任务库字段变化', () => {
     expect(w.logs.some((l) => l.kind === 'error')).toBe(false)
   })
 
+  it('属性 ID 编码形式不同（%E6… 与原文）视为同一个字段，并改用任务库里的写法', async () => {
+    const w = await initialized((w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口' }))
+    const original = w.profile.schema!.tasks.props.didaId
+    w.profile.schema = {
+      ...w.profile.schema!,
+      tasks: { ...w.profile.schema!.tasks, props: { ...w.profile.schema!.tasks.props, didaId: encodeURIComponent(original) } }
+    }
+    expect(w.profile.schema.tasks.props.didaId).not.toBe(original)
+    const saved: FlowSchema[] = []
+    const engine = new SyncEngine({
+      dida: w.dida,
+      notion: w.notion,
+      store: w.store,
+      profile: w.profile,
+      settings: w.settings,
+      log: (e) => w.logs.push(e),
+      now: () => w.now.value,
+      onSchemaChange: (s) => saved.push(s)
+    })
+    w.dida.addTask({ id: 't2', projectId: 'p-dev', title: '新任务' })
+    const res = await engine.runRound()
+    expect(res.summary.warnings.some((m) => m.includes('重新识别'))).toBe(false)
+    expect(saved[0]?.tasks.props.didaId).toBe(original)
+    expect(pageByDidaId(w, 't2')).toBeDefined()
+    expect(w.logs.some((l) => l.kind === 'error')).toBe(false)
+  })
+
+  it('任务库返回编码形式的 ID、本地存的是原文：同样视为同一个字段', async () => {
+    const w = await initialized((w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口' }))
+    const ds = tasksDs(w)
+    const encoded = encodeURIComponent(ds.properties['滴答ID']!.id)
+    ds.properties['滴答ID'] = { ...ds.properties['滴答ID']!, id: encoded }
+    w.dida.addTask({ id: 't2', projectId: 'p-dev', title: '新任务' })
+    const res = await w.engine().runRound()
+    expect(res.summary.warnings.some((m) => m.includes('重新识别'))).toBe(false)
+    expect(pageByDidaId(w, 't2')).toBeDefined()
+    expect(w.logs.some((l) => l.kind === 'error')).toBe(false)
+  })
+
+  it('必需字段删掉后又新建了同名字段：自动改绑，同步照常', async () => {
+    const w = await initialized(
+      (w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口', dueDate: '2026-09-28T02:00:00.000+0000', timeZone: 'Asia/Shanghai' })
+    )
+    const ds = tasksDs(w)
+    delete ds.properties['排期']
+    ds.properties['排期'] = { id: 'p_sched2', name: '排期', type: 'date' }
+    w.dida.updateTask('t1', { dueDate: '2026-09-29T02:00:00.000+0000' })
+    const res = await w.engine().runRound()
+    expect(res.summary.warnings).toContain('任务库的「排期」字段已重新识别')
+    expect(prop(pageByDidaId(w, 't1')!, '排期')?.date?.start).toBe('2026-09-29T10:00:00+08:00')
+  })
+
   it('必需字段被删除：给出明确的错误', async () => {
     const w = await initialized((w) => void w.dida.addTask({ id: 't1', projectId: 'p-dev', title: '写接口' }))
     delete tasksDs(w).properties['排期']

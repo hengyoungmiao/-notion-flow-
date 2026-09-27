@@ -29,6 +29,10 @@ export class FakeDida implements DidaReader {
   inboxInFilter = true
   /** 模拟接口对不存在的清单报错（而不是 404） */
   failGetForUnknownProject = false
+  /** 模拟 project list 不返回、但 project get 能查到的清单（例如已归档） */
+  hiddenProjects: DidaProject[] = []
+  /** 模拟 project get 对某些清单报错 */
+  projectErrors = new Map<string, CliError>()
 
   private check(name: string): void {
     this.calls.push(name)
@@ -72,6 +76,13 @@ export class FakeDida implements DidaReader {
     this.check('projects')
     return structuredClone(this.projects)
   }
+  async getProject(projectId: string): Promise<DidaProject | null> {
+    this.check('getProject')
+    const error = this.projectErrors.get(projectId)
+    if (error) throw error
+    const p = [...this.projects, ...this.hiddenProjects].find((x) => x.id === projectId)
+    return p ? structuredClone(p) : null
+  }
   async listGroups(): Promise<DidaGroup[]> {
     this.check('groups')
     return structuredClone(this.groups)
@@ -96,7 +107,11 @@ export class FakeDida implements DidaReader {
   }
   async getTask(projectId: string, taskId: string): Promise<DidaTask | null> {
     this.check('get')
-    if (this.failGetForUnknownProject && !projectId.startsWith('inbox') && !this.projects.some((p) => p.id === projectId))
+    if (
+      this.failGetForUnknownProject &&
+      !projectId.startsWith('inbox') &&
+      ![...this.projects, ...this.hiddenProjects].some((p) => p.id === projectId)
+    )
       throw new CliError('DIDA API 错误 400: project not found', 'dida', 'validation', 400)
     const t = this.tasks.get(taskId)
     return t && t.projectId === projectId ? structuredClone(t) : null

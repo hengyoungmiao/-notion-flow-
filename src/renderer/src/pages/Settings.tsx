@@ -48,12 +48,6 @@ export default function Settings({ state }: { state: AppViewState }) {
             <Form.Item label="重复任务按日程处理" extra="重复任务的「任务类型」固定为「日程」（Notion 里改掉会被改回），并且不按标签关联项目。">
               <Switch checked={s.recurringAsSchedule} onChange={(v) => void save({ recurringAsSchedule: v })} />
             </Form.Item>
-            <Form.Item
-              label="滴答清单归档后，其中未完成的任务标记完成"
-              extra="完成日期填检测到归档的那天；清单重新打开后恢复按滴答的实际状态同步。关闭时只解除关联，页面保持原样。"
-            >
-              <Switch checked={s.archivedListsComplete} onChange={(v) => void save({ archivedListsComplete: v })} />
-            </Form.Item>
             <Form.Item label="同步番茄钟和正计时记录" extra="写入 FLO.W「任务番茄数据库」，并关联到对应任务；任务的「番茄时长统计」会自动计算。">
               <Space>
                 <Switch checked={s.syncFocus} onChange={(v) => void save({ syncFocus: v })} />

@@ -243,8 +243,6 @@ export interface AppSettings {
   syncProjects: boolean
   /** 重复任务：「任务类型」固定为「日程」，且不按标签关联项目 */
   recurringAsSchedule: boolean
-  /** 滴答清单归档后，其中未完成的任务在 Notion 标记完成（完成日期为检测到归档的那天） */
-  archivedListsComplete: boolean
   applyTemplate: boolean
   recurringCompletionRecords: boolean
   /** 同步滴答的番茄钟/正计时记录到 FLO.W 任务番茄数据库 */
@@ -346,13 +344,13 @@ export interface WorkspaceState {
     cursor: string | null
     links: Record<string, FocusLink>
   }
-  /** 滴答清单的归档/删除记录（检测日期用于“清单已归档，任务标记完成”的完成日期） */
+  /** 滴答清单的归档/删除记录（归档清单里的任务不做任何同步；已删除清单在映射页显示 30 天） */
   lists: ListLifecycle
 }
 
 export interface ListLifecycle {
-  /** 已归档（closed）的清单：date 为检测到归档那天的本地日期 YYYY-MM-DD */
-  archived: Record<string, { name: string; date: string; at: string }>
+  /** 已归档（closed）的清单：date 为检测到归档那天的本地日期；checkedAt 为最近一次向滴答确认它还存在的时间 */
+  archived: Record<string, { name: string; date: string; at: string; checkedAt?: string }>
   /** 已在滴答删除的清单（映射页显示 30 天） */
   deleted: Record<string, { name: string; at: string }>
 }
