@@ -24,8 +24,8 @@ export function NotionConnect({ workspace, onDone }: Props) {
   const [adding, setAdding] = useState(false)
 
   const loggedIn = workspace.loggedIn && !!workspace.notionWorkspaceName
-  const bound = !!workspace.schema && !bind?.needsDidaIdProperty
-  const step = !loggedIn ? 0 : !workspace.schema || bind?.needsDidaIdProperty ? 1 : 2
+  const bound = workspace.ready && !bind?.needsDidaIdProperty
+  const step = !loggedIn ? 0 : !bound ? 1 : 2
 
   useEffect(() => {
     if (step === 2) onDone?.()
@@ -63,7 +63,7 @@ export function NotionConnect({ workspace, onDone }: Props) {
   }
 
   useEffect(() => {
-    if (loggedIn && !workspace.schema && candidates === null && !searching) void search()
+    if (loggedIn && !workspace.ready && candidates === null && !searching) void search()
   }, [loggedIn])
 
   const doBind = async (target: string) => {
