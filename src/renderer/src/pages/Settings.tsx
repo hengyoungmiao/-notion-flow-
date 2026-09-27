@@ -39,6 +39,20 @@ export default function Settings({ state }: { state: AppViewState }) {
             <Form.Item label="滴答任务描述 → 「下一步做什么？」">
               <Switch checked={s.syncNote} onChange={(v) => void save({ syncNote: v })} />
             </Form.Item>
+            <Form.Item label="同步番茄钟和正计时记录" extra="写入 FLO.W「任务番茄数据库」，并关联到对应任务；任务的「番茄时长统计」会自动计算。">
+              <Space>
+                <Switch checked={s.syncFocus} onChange={(v) => void save({ syncFocus: v })} />
+                <InputNumber
+                  min={0}
+                  max={365}
+                  addonBefore="首次导入最近"
+                  addonAfter="天"
+                  disabled={!s.syncFocus}
+                  value={s.focusImportDays}
+                  onChange={(v) => v !== null && void save({ focusImportDays: v })}
+                />
+              </Space>
+            </Form.Item>
             <Form.Item label="滴答新增的清单/文件夹自动在 Notion 新建领域">
               <Switch checked={s.autoCreateDomains} onChange={(v) => void save({ autoCreateDomains: v })} />
             </Form.Item>

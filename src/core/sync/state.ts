@@ -13,7 +13,8 @@ export function emptyState(workspaceId: string): WorkspaceState {
     notionRemoved: {},
     domains: { lists: {}, groups: {} },
     pendingApproval: null,
-    foreignSightings: 0
+    foreignSightings: 0,
+    focus: { cursor: null, links: {} }
   }
 }
 
@@ -53,7 +54,8 @@ export class FileStateStore implements StateStore {
     return {
       ...emptyState(workspaceId),
       ...data,
-      domains: { lists: data.domains?.lists ?? {}, groups: data.domains?.groups ?? {} }
+      domains: { lists: data.domains?.lists ?? {}, groups: data.domains?.groups ?? {} },
+      focus: { cursor: data.focus?.cursor ?? null, links: data.focus?.links ?? {} }
     }
   }
 

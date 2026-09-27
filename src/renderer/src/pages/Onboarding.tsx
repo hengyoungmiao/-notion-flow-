@@ -169,7 +169,7 @@ export function SetupFlow({ state, mode = 'first-run', workspaceId, onFinished }
 
       {current === 'scope' && ws && (
         <Card>
-          <ScopeForm workspace={ws} />
+          <ScopeForm workspace={ws} settings={state.settings} />
         </Card>
       )}
 

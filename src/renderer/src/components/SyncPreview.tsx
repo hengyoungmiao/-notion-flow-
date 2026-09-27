@@ -48,12 +48,17 @@ export function SyncPreview({ summary }: { summary: RoundSummary }) {
             <Statistic title="关联已有任务" value={summary.matches.length} />
           </Card>
         </Col>
-        <Col span={6}>
+        <Col span={4}>
           <Card size="small">
             <Statistic title="新建领域" value={summary.domainCreates.length} />
           </Card>
         </Col>
-        <Col span={6}>
+        <Col span={4}>
+          <Card size="small">
+            <Statistic title="番茄记录" value={summary.focus.creates} />
+          </Card>
+        </Col>
+        <Col span={4}>
           <Card size="small">
             <Statistic title="删除/放弃" value={summary.destructive.length} valueStyle={summary.destructive.length ? { color: '#dc2626' } : undefined} />
           </Card>

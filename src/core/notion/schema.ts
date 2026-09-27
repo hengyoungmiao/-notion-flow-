@@ -24,6 +24,7 @@ export function dataSourceTitle(ds: NotionDataSource): string {
 export interface TaskBinding {
   tasks: Omit<FlowSchema['tasks'], 'props'> & { props: Omit<FlowSchema['tasks']['props'], 'didaId'> & { didaId: string | null } }
   domainsDataSourceId: string | null
+  focusDataSourceId: string | null
   issues: BindIssue[]
 }
 
@@ -38,6 +39,7 @@ export function bindTaskSchema(ds: NotionDataSource): TaskBinding {
   const domain = pick(list, 'relation', /^二级领域$/)
   const didaId = pick(list, 'rich_text', new RegExp(`^${DIDA_ID_PROPERTY}$`))
   const taskType = pick(list, 'select', /^任务类型$/)
+  const focus = pick(list, 'relation', /番茄/)
 
   if (!title) issues.push({ level: 'error', message: '任务库缺少标题字段' })
   if (!status) issues.push({ level: 'error', message: '任务库缺少「状态」字段（status 类型）' })
@@ -74,7 +76,27 @@ export function bindTaskSchema(ds: NotionDataSource): TaskBinding {
       taskTypeOptions
     },
     domainsDataSourceId: domain?.relation?.data_source_id ?? null,
+    focusDataSourceId: focus?.relation?.data_source_id ?? null,
     issues
+  }
+}
+
+/** FLO.W「任务番茄数据库」：名称、关联任务、开始时间、结束时间、番茄默认时长 */
+export function bindFocusSchema(ds: NotionDataSource, tasksDataSourceId: string): NonNullable<FlowSchema['focus']> | null {
+  const list = props(ds)
+  const title = list.find((p) => p.type === 'title')
+  const normalize = (id: string | undefined) => (id ?? '').replace(/-/g, '')
+  const task =
+    list.find((p) => p.type === 'relation' && normalize(p.relation?.data_source_id) === normalize(tasksDataSourceId)) ??
+    pick(list, 'relation', /关联任务/)
+  const start = pick(list, 'date', /^开始时间$/)
+  const end = pick(list, 'date', /^结束时间$/)
+  const minutes = pick(list, 'number', /时长/)
+  if (!title || !task || !start) return null
+  return {
+    dataSourceId: ds.id,
+    title: dataSourceTitle(ds),
+    props: { title: title.id, task: task.id, start: start.id, end: end?.id ?? null, minutes: minutes?.id ?? null }
   }
 }
 

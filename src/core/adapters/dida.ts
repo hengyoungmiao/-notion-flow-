@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon'
-import type { DidaGroup, DidaPreference, DidaProject, DidaTask } from '../types'
+import type { DidaFocus, DidaGroup, DidaPreference, DidaProject, DidaTask } from '../types'
 import { CliError, classifyDidaError, runProcess, summarizeStderr, withRetry } from './exec'
 
 /** 对滴答清单只读：本应用永远不会写入或删除滴答数据 */
@@ -14,6 +14,24 @@ export interface DidaReader {
   getTask(projectId: string, taskId: string): Promise<DidaTask | null>
   /** 收件箱未完成任务；接口不支持时返回 null */
   listInboxTasks(): Promise<DidaTask[] | null>
+  /** 专注记录（接口单次最多 30 天，调用方负责分段） */
+  listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]>
+  /** 返回 null 表示 404（记录已删除） */
+  getFocus(focusId: string, type: FocusKind): Promise<DidaFocus | null>
+}
+
+export type FocusKind = 'pomodoro' | 'timing'
+
+const DAY = 86_400_000
+
+/** 按不超过 30 天的窗口分段读取专注记录 */
+export async function listFocusRange(dida: DidaReader, from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]> {
+  const out = new Map<string, DidaFocus>()
+  for (let start = from.getTime(); start < to.getTime(); start += 29 * DAY) {
+    const end = Math.min(to.getTime(), start + 29 * DAY)
+    for (const f of await dida.listFocus(new Date(start), new Date(end), type)) out.set(f.id, f)
+  }
+  return [...out.values()]
 }
 
 export interface DidaCommand {
@@ -94,6 +112,22 @@ export class DidaCliReader implements DidaReader {
       return data?.tasks ?? []
     } catch (e) {
       if (e instanceof CliError && (e.kind === 'not_found' || e.kind === 'validation')) return null
+      throw e
+    }
+  }
+
+  listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]> {
+    return this.run<DidaFocus[]>(['focus', 'list', '--from', formatDidaTime(from), '--to', formatDidaTime(to), '--type', type]).then(
+      (r) => (Array.isArray(r) ? r : [])
+    )
+  }
+
+  async getFocus(focusId: string, type: FocusKind): Promise<DidaFocus | null> {
+    try {
+      const f = await this.run<DidaFocus>(['focus', 'get', focusId, '--type', type])
+      return f && f.id ? f : null
+    } catch (e) {
+      if (e instanceof CliError && e.kind === 'not_found') return null
       throw e
     }
   }

@@ -14,6 +14,7 @@ import {
   ensureDidaIdProperty,
   findTaskCandidates,
   resolveTaskDataSource,
+  upgradeFocusSchema,
   validateSchema
 } from '../core/notion/discovery'
 import { Scheduler, type SchedulerSnapshot } from '../core/scheduler'
@@ -115,7 +116,21 @@ export class AppController implements FlowSyncApi {
     const c = this.config.get()
     this.hooks.setLaunchAtLogin(c.settings.launchAtLogin, c.settings.startMinimized)
     void this.didaCheck()
+    await this.upgradeSchemas()
     if (c.onboarded) this.scheduler.start()
+  }
+
+  /** 旧版本识别的工作空间补充识别番茄库（失败不影响任务同步） */
+  private async upgradeSchemas(): Promise<void> {
+    for (const ws of this.config.get().workspaces) {
+      if (!ws.schema || ws.schema.focus !== undefined) continue
+      try {
+        const schema = await upgradeFocusSchema(this.clientFor(ws), ws.schema)
+        await this.config.upsertWorkspace({ ...this.workspace(ws.id), schema })
+      } catch {
+        /* 下次启动再试 */
+      }
+    }
   }
 
   // ───────────────────────── 内部工具 ─────────────────────────
@@ -512,7 +527,7 @@ export class AppController implements FlowSyncApi {
         this.scheduler.record(res)
         this.activity.push({
           kind: 'info',
-          title: `首次同步完成：新建 ${res.summary.counts.creates} 个、关联 ${res.summary.matches.length} 个任务`,
+          title: `首次同步完成：新建 ${res.summary.counts.creates} 个、关联 ${res.summary.matches.length} 个任务${res.summary.focus.creates ? `，导入 ${res.summary.focus.creates} 条番茄记录` : ''}`,
           detail: res.backupPath ? `备份：${res.backupPath}` : undefined
         })
         await this.config.update((c) => {

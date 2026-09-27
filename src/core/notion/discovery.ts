@@ -5,6 +5,7 @@ import {
   DIDA_ID_PROPERTY,
   bindAreaSchema,
   bindDomainSchema,
+  bindFocusSchema,
   bindTaskSchema,
   dataSourceTitle,
   looksLikeFlowTasks,
@@ -100,12 +101,44 @@ export async function bindFlowSchema(client: NotionClient, taskDataSourceId: str
     }
   }
 
+  const focus = await loadFocusSchema(client, task.focusDataSourceId, taskDs.id, issues)
   const schema: FlowSchema = {
     tasks: { ...task.tasks, props: { ...task.tasks.props, didaId: task.tasks.props.didaId ?? '' } },
     domains,
-    areas
+    areas,
+    focus
   }
   return { schema, issues, needsDidaIdProperty: !task.tasks.props.didaId }
+}
+
+async function loadFocusSchema(
+  client: NotionClient,
+  focusDataSourceId: string | null,
+  tasksDataSourceId: string,
+  issues: BindIssue[]
+): Promise<FlowSchema['focus']> {
+  if (!focusDataSourceId) {
+    issues.push({ level: 'warning', message: '未找到「关联番茄」字段，将不同步番茄钟记录' })
+    return null
+  }
+  try {
+    const bound = bindFocusSchema(await client.getDataSource(focusDataSourceId), tasksDataSourceId)
+    if (!bound) issues.push({ level: 'warning', message: '番茄数据库缺少「开始时间」或「关联任务」字段，将不同步番茄钟记录' })
+    return bound
+  } catch (e) {
+    if (e instanceof CliError && e.kind === 'auth') throw e
+    issues.push({ level: 'warning', message: '无法读取番茄数据库，将不同步番茄钟记录' })
+    return null
+  }
+}
+
+/** 旧版本识别的配置没有番茄库：补充识别（不改动其它绑定） */
+export async function upgradeFocusSchema(client: NotionClient, schema: FlowSchema): Promise<FlowSchema> {
+  if (schema.focus !== undefined) return schema
+  const taskDs = await client.getDataSource(schema.tasks.dataSourceId)
+  const task = bindTaskSchema(taskDs)
+  const focus = await loadFocusSchema(client, task.focusDataSourceId, taskDs.id, [])
+  return { ...schema, focus }
 }
 
 /** 在任务库中新增「滴答ID」文本字段（只新增，不改动模板原有字段） */

@@ -44,6 +44,11 @@ export function createDemoDida(): FakeDida {
   add('d09', 'p-fitness', '跑步 5 公里', at(0, 7))
   add('d10', 'p-home', '交物业费', at(5, null))
   add('d11', 'inbox-demo', '回复房东消息', null)
+  const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString().replace(/\.\d{3}Z$/, '+0000')
+  dida.addFocus({ id: 'fc1', type: 0, taskId: 'd01', startTime: ago(180), endTime: ago(155), duration: 1500 })
+  dida.addFocus({ id: 'fc2', type: 0, taskId: 'd01', startTime: ago(150), endTime: ago(125), duration: 1500, note: '整理需求优先级' })
+  dida.addFocus({ id: 'fc3', type: 1, taskId: 'd08', startTime: ago(600), endTime: ago(540), duration: 3600 })
+  dida.addFocus({ id: 'fc4', type: 0, taskId: 'd06', startTime: ago(60), endTime: ago(35), duration: 1500 })
   dida.addTask({
     id: 'd12',
     projectId: 'p-reading',

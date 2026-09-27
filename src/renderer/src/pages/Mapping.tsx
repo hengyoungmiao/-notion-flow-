@@ -23,7 +23,7 @@ export default function Mapping({ state }: { state: AppViewState }) {
             <MappingTable workspaceId={ws.id} />
           </Card>
           <Card title="同步范围">
-            <ScopeForm workspace={ws} />
+            <ScopeForm workspace={ws} settings={state.settings} />
           </Card>
         </Space>
       ) : (

@@ -45,6 +45,22 @@ export interface DidaTask {
   priority?: number
 }
 
+/** 专注记录：type 0 = 番茄钟，1 = 正计时 */
+export interface DidaFocus {
+  id: string
+  type?: number | string
+  taskId?: string | null
+  tasks?: Array<{ taskId?: string; id?: string; title?: string; projectId?: string }> | null
+  note?: string | null
+  startTime?: string | null
+  endTime?: string | null
+  /** 专注时长（秒） */
+  duration?: number | null
+  pauseDuration?: number | null
+  status?: number | null
+  etag?: string | null
+}
+
 export interface DidaPreference {
   timeZone?: string
   [key: string]: unknown
@@ -159,6 +175,12 @@ export interface FlowSchema {
     title: string
     props: { title: string }
   } | null
+  /** FLO.W「任务番茄数据库」（通过任务库的「关联番茄」找到）；undefined 表示旧配置尚未识别 */
+  focus?: {
+    dataSourceId: string
+    title: string
+    props: { title: string; task: string; start: string; end: string | null; minutes: string | null }
+  } | null
 }
 
 // ───────────────────────── 配置 ─────────────────────────
@@ -200,6 +222,10 @@ export interface AppSettings {
   syncNote: boolean
   applyTemplate: boolean
   recurringCompletionRecords: boolean
+  /** 同步滴答的番茄钟/正计时记录到 FLO.W 任务番茄数据库 */
+  syncFocus: boolean
+  /** 首次同步专注记录时导入最近几天 */
+  focusImportDays: number
   autoCreateDomains: boolean
   launchAtLogin: boolean
   startMinimized: boolean
@@ -247,6 +273,18 @@ export interface DomainLink {
   writtenAreaPageId: string | null
 }
 
+export interface FocusLink {
+  focusId: string
+  pageId: string
+  taskDidaId: string
+  kind: 'pomodoro' | 'timing'
+  /** 开始时间（UTC ISO），用于判断是否在本轮读取窗口内 */
+  startTime: string
+  hash: string
+  /** 在 Notion 中被删除：不再重建 */
+  removed?: boolean
+}
+
 export interface PendingApproval {
   createdAt: string
   reason: string
@@ -269,6 +307,11 @@ export interface WorkspaceState {
   }
   pendingApproval: PendingApproval | null
   foreignSightings: number
+  focus: {
+    /** 上次成功读取专注记录的时间 */
+    cursor: string | null
+    links: Record<string, FocusLink>
+  }
 }
 
 // ───────────────────────── 规范化值 ─────────────────────────

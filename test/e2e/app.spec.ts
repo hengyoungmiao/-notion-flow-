@@ -57,6 +57,7 @@ test('首次设置向导（演示模式）', async () => {
 
   await expect(page.getByText('首次同步预览')).toBeVisible()
   await expect(page.getByText('关联已有任务')).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByText('番茄记录')).toBeVisible()
   await shot(page, '09-preview')
   await page.getByRole('button', { name: /备份并开始首次同步/ }).click()
   await expect(page.getByText('首次同步完成')).toBeVisible({ timeout: 20_000 })
@@ -83,6 +84,7 @@ test('主界面各页面（演示模式，已配置）', async () => {
 
   await page.getByRole('menuitem', { name: '同步记录' }).click()
   await expect(page.getByText('首次同步完成').first()).toBeVisible()
+  await expect(page.getByText('番茄钟 · 整理 v2.3 需求清单（25 分钟）').first()).toBeVisible()
   await shot(page, '23-activity')
 
   await page.getByRole('menuitem', { name: '设置' }).click()

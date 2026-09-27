@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { DidaReader } from './adapters/dida'
-import type { DidaTask } from './types'
+import type { DidaFocus, DidaTask } from './types'
 import { parseDidaTime } from './mapping/dates'
 
 const hash = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 10)
@@ -16,6 +16,22 @@ export interface DiagnosticsReport {
   taskFieldNames: string[]
   hasModifiedTime: boolean
   samples: Record<string, unknown[]>
+  focus: { pomodoro: unknown[]; timing: unknown[]; fieldNames: string[]; error: string | null }
+}
+
+export function sanitizeFocus(f: DidaFocus): Record<string, unknown> {
+  return {
+    id: hash(f.id),
+    type: f.type ?? null,
+    hasTaskId: !!f.taskId,
+    taskBriefKeys: f.tasks?.[0] ? Object.keys(f.tasks[0]).sort() : null,
+    startTime: f.startTime ?? null,
+    endTime: f.endTime ?? null,
+    duration: f.duration ?? null,
+    pauseDuration: f.pauseDuration ?? null,
+    status: f.status ?? null,
+    noteLength: (f.note ?? '').length
+  }
 }
 
 /** 去掉标题/描述等个人内容，只保留日期与结构字段，用于校准日期换算 */
@@ -59,6 +75,17 @@ export async function collectDiagnostics(dida: DidaReader, now = new Date()): Pr
   ])
   const completed = await dida.listCompletedTasks(new Date(now.getTime() - 14 * 86_400_000), now)
   const inbox = await dida.listInboxTasks().catch(() => null)
+  const focus: DiagnosticsReport['focus'] = { pomodoro: [], timing: [], fieldNames: [], error: null }
+  try {
+    const from = new Date(now.getTime() - 14 * 86_400_000)
+    const pomodoro = await dida.listFocus(from, now, 'pomodoro')
+    const timing = await dida.listFocus(from, now, 'timing')
+    focus.pomodoro = pomodoro.slice(0, 4).map(sanitizeFocus)
+    focus.timing = timing.slice(0, 4).map(sanitizeFocus)
+    focus.fieldNames = [...new Set([...pomodoro, ...timing].flatMap((f) => Object.keys(f)))].sort()
+  } catch (e) {
+    focus.error = e instanceof Error ? e.message : String(e)
+  }
   const all = [...open, ...completed]
   const pick = (f: (t: DidaTask) => boolean, n = 4) => all.filter(f).slice(0, n).map(sanitizeTask)
   const fieldNames = new Set<string>()
@@ -83,6 +110,7 @@ export async function collectDiagnostics(dida: DidaReader, now = new Date()): Pr
       checklist: pick((t) => t.kind === 'CHECKLIST'),
       subtask: pick((t) => !!t.parentId),
       inbox: (inbox ?? []).slice(0, 3).map(sanitizeTask)
-    }
+    },
+    focus
   }
 }

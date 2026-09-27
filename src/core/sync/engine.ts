@@ -1,5 +1,5 @@
 import type { ActivitySink } from '../activity'
-import type { DidaReader } from '../adapters/dida'
+import { listFocusRange, type DidaReader } from '../adapters/dida'
 import { CliError } from '../adapters/exec'
 import { queryAll, type NotionClient } from '../adapters/notion'
 import { planDomains, type DomainOp, type DomainPlan, type NotionAreaPage, type NotionDomainPage } from '../mapping/domains'
@@ -16,9 +16,12 @@ import {
   type TaskPatch
 } from '../mapping/task'
 import { plainText, toRichText } from '../mapping/text'
+import { buildFocusProperties, focusPageStartKey } from '../mapping/focus'
+import { missingInWindow, planFocus, type FocusOp } from './focus'
 import type {
   AppSettings,
   DesiredTask,
+  DidaFocus,
   DidaGroup,
   DidaPreference,
   DidaProject,
@@ -71,6 +74,8 @@ export interface RoundSummary {
   destructive: PlanItem[]
   domainCreates: PlanItem[]
   domainRows: DomainPlan['rows']
+  /** 番茄钟/正计时记录 */
+  focus: { creates: number; updates: number; trashes: number }
   warnings: string[]
 }
 
@@ -94,6 +99,15 @@ interface Structure {
   areas: NotionAreaPage[]
 }
 
+interface FocusLoad {
+  records: DidaFocus[]
+  confirmations: Map<string, DidaFocus | null>
+  from: Date
+  to: Date
+}
+
+const FOCUS_INTERVAL_MS = 60_000
+
 export class NeedsInitialSyncError extends Error {
   constructor() {
     super('该工作空间还没有完成首次同步')
@@ -103,6 +117,8 @@ export class NeedsInitialSyncError extends Error {
 
 export class SyncEngine {
   private structure: Structure | null = null
+  private lastFocusAt = 0
+  private focusWarned = false
   private readonly now: () => Date
 
   constructor(private readonly deps: EngineDeps) {
@@ -221,6 +237,36 @@ export class SyncEngine {
     return { candidates, pages }
   }
 
+  /** 读取专注记录（番茄钟 + 正计时），并确认窗口内缺席的记录是否已删除 */
+  private async loadFocus(state: WorkspaceState, now: Date, initial: boolean, force: boolean): Promise<FocusLoad | null> {
+    const { dida, settings } = this.deps
+    if (!this.schema.focus || !settings.syncFocus) return null
+    if (!initial && !force && state.focus.cursor && now.getTime() - this.lastFocusAt < FOCUS_INTERVAL_MS) return null
+    const day = 86_400_000
+    const from = state.focus.cursor
+      ? new Date(Date.parse(state.focus.cursor) - day)
+      : new Date(now.getTime() - Math.max(0, settings.focusImportDays) * day)
+    try {
+      const records =
+        from < now
+          ? [...(await listFocusRange(dida, from, now, 'pomodoro')), ...(await listFocusRange(dida, from, now, 'timing'))]
+          : []
+      const seen = new Set(records.map((r) => r.id))
+      const confirmations = new Map<string, DidaFocus | null>()
+      for (const link of missingInWindow(state, seen, from, now).slice(0, 30))
+        confirmations.set(link.focusId, await dida.getFocus(link.focusId, link.kind))
+      this.lastFocusAt = now.getTime()
+      return { records, confirmations, from, to: now }
+    } catch (e) {
+      if (e instanceof CliError && e.kind === 'auth') throw e
+      if (!this.focusWarned) {
+        this.focusWarned = true
+        this.log({ kind: 'warning', title: '读取滴答专注记录失败，本轮跳过番茄钟同步', detail: e instanceof Error ? e.message : String(e) })
+      }
+      return null
+    }
+  }
+
   /** 供界面展示的领域映射表（不写入） */
   async inspectStructure(force = true): Promise<{
     rows: DomainPlan['rows']
@@ -319,6 +365,9 @@ export class SyncEngine {
     })
     const warnings = [...domainPlan.warnings, ...plan.warnings]
     const summary = summarize(plan.ops, domainPlan, warnings)
+    const zone =
+      (typeof structure.preference.timeZone === 'string' && structure.preference.timeZone) || settings.defaultTimeZone
+    const focusLoad = await this.loadFocus(state, now, initial, !!opts.forceReconcile)
 
     let ops = plan.ops
     let blocked: PendingApproval | null = null
@@ -331,6 +380,28 @@ export class SyncEngine {
     }
 
     if (opts.dryRun) {
+      if (focusLoad) {
+        // 预览：本轮将新建/关联的任务也视为已同步
+        const planned = new Map<string, string>()
+        for (const op of plan.ops) {
+          if (op.kind === 'create') planned.set(op.desired.didaId, op.desired.title)
+          else if (op.kind === 'update' || op.kind === 'link') planned.set(op.didaId, op.desired.title)
+        }
+        const focusOps = planFocus({
+          records: focusLoad.records,
+          state,
+          taskFor: (id) => {
+            const link = state.tasks[id]
+            if (link) return { pageId: link.pageId, title: link.written.title }
+            return planned.has(id) ? { pageId: 'pending', title: planned.get(id)! } : null
+          },
+          from: focusLoad.from,
+          to: focusLoad.to,
+          confirmations: focusLoad.confirmations,
+          zone
+        })
+        summary.focus = countFocus(focusOps)
+      }
       return { summary, applied: false, blocked, writes: 0, reconciled: reconcileDue, backupPath: null, durationMs: Date.now() - started }
     }
 
@@ -349,6 +420,35 @@ export class SyncEngine {
       if (domainPlan.ops.some((o) => o.kind === 'createDomain' || o.kind === 'createArea' || o.kind === 'setDomainArea'))
         this.invalidateStructure()
       await this.applyTaskOps(ops, state, writes)
+      if (focusLoad) {
+        let focusOps = planFocus({
+          records: focusLoad.records,
+          state,
+          taskFor: (id) => {
+            const link = state.tasks[id]
+            return link ? { pageId: link.pageId, title: link.written.title } : null
+          },
+          from: focusLoad.from,
+          to: focusLoad.to,
+          confirmations: focusLoad.confirmations,
+          zone
+        })
+        const trashes = focusOps.filter((o) => o.kind === 'focusTrash').length
+        if (!initial && !opts.approve && (blocked || trashes > settings.breaker.maxTrash)) {
+          if (!blocked && trashes > 0)
+            blocked = {
+              createdAt: now.toISOString(),
+              reason: `计划删除 ${trashes} 条番茄记录（上限 ${settings.breaker.maxTrash}）`,
+              trash: trashes,
+              updates: 0,
+              sample: []
+            }
+          focusOps = focusOps.filter((o) => o.kind !== 'focusTrash')
+        }
+        summary.focus = countFocus(focusOps)
+        await this.applyFocusOps(focusOps, state, writes)
+        state.focus.cursor = focusLoad.to.toISOString()
+      }
     } finally {
       state.pendingApproval = blocked
       if (!blocked && opts.approve) state.pendingApproval = null
@@ -615,6 +715,80 @@ export class SyncEngine {
     return readActual(page, this.schema)
   }
 
+  // ───────────────────────── 写入：番茄钟 ─────────────────────────
+
+  private async applyFocusOps(ops: FocusOp[], state: WorkspaceState, writes: { count: number }): Promise<void> {
+    const fs = this.schema.focus
+    if (!fs || ops.length === 0) return
+    const { notion } = this.deps
+    const byTask = new Map<string, NotionPage[]>()
+    const linkedPages = new Set(Object.values(state.focus.links).map((l) => l.pageId))
+    const pagesOf = async (taskPageId: string): Promise<NotionPage[]> => {
+      let pages = byTask.get(taskPageId)
+      if (!pages) {
+        pages = await queryAll(notion, fs.dataSourceId, { filter: { property: fs.props.task, relation: { contains: taskPageId } } })
+        byTask.set(taskPageId, pages)
+      }
+      return pages
+    }
+    for (const op of ops) {
+      try {
+        if (op.kind === 'focusCreate') {
+          const d = op.desired
+          const properties = buildFocusProperties(d, fs, op.taskPageId)
+          // 去重：同一任务下开始时间相同的番茄记录视为同一条
+          const existing = (await pagesOf(op.taskPageId)).find(
+            (p) => !linkedPages.has(p.id) && focusPageStartKey(p, fs) === d.startKey
+          )
+          let pageId: string
+          if (existing) {
+            await notion.updatePage(existing.id, { properties })
+            pageId = existing.id
+          } else {
+            const page = await notion.createPage({ parent: { type: 'data_source_id', data_source_id: fs.dataSourceId }, properties })
+            byTask.get(op.taskPageId)?.push(page)
+            pageId = page.id
+          }
+          writes.count++
+          linkedPages.add(pageId)
+          state.focus.links[d.focusId] = { focusId: d.focusId, pageId, taskDidaId: d.taskDidaId, kind: d.kind, startTime: d.startKey, hash: d.hash }
+          this.log({
+            kind: existing ? 'relink' : 'create',
+            title: `${d.title}${d.minutes !== null ? `（${d.minutes} 分钟）` : ''}`,
+            didaId: d.taskDidaId,
+            pageId
+          })
+        } else if (op.kind === 'focusUpdate') {
+          const d = op.desired
+          try {
+            await notion.updatePage(op.pageId, { properties: buildFocusProperties(d, fs, op.taskPageId) })
+          } catch (e) {
+            if (e instanceof CliError && e.kind === 'not_found') {
+              const link = state.focus.links[d.focusId]
+              if (link) link.removed = true
+              continue
+            }
+            throw e
+          }
+          writes.count++
+          state.focus.links[d.focusId] = { ...state.focus.links[d.focusId]!, taskDidaId: d.taskDidaId, startTime: d.startKey, hash: d.hash }
+          this.log({ kind: 'update', title: d.title, detail: '番茄记录', didaId: d.taskDidaId, pageId: op.pageId })
+        } else {
+          await notion.updatePage(op.pageId, { in_trash: true })
+          writes.count++
+          delete state.focus.links[op.focusId]
+          this.log({ kind: 'trash', title: '滴答中已删除专注记录，番茄记录移入回收站', pageId: op.pageId })
+        }
+      } catch (e) {
+        if (e instanceof CliError && (e.kind === 'validation' || e.kind === 'not_found')) {
+          this.log({ kind: 'error', title: '写入番茄记录失败', detail: e.message })
+          continue
+        }
+        throw e
+      }
+    }
+  }
+
   /** 重新创建一个在 Notion 中被删除的任务（界面「重新创建」按钮） */
   async restore(didaId: string): Promise<void> {
     const state = await this.deps.store.load(this.deps.profile.id)
@@ -632,6 +806,7 @@ function summarize(ops: TaskOp[], domainPlan: DomainPlan, warnings: string[]): R
     destructive: [],
     domainCreates: [],
     domainRows: domainPlan.rows,
+    focus: { creates: 0, updates: 0, trashes: 0 },
     warnings
   }
   for (const op of ops) {
@@ -650,4 +825,12 @@ function summarize(ops: TaskOp[], domainPlan: DomainPlan, warnings: string[]): R
     if (op.kind === 'createDomain') s.domainCreates.push({ title: op.name, detail: '二级领域' })
   }
   return s
+}
+
+function countFocus(ops: FocusOp[]): RoundSummary['focus'] {
+  return {
+    creates: ops.filter((o) => o.kind === 'focusCreate').length,
+    updates: ops.filter((o) => o.kind === 'focusUpdate').length,
+    trashes: ops.filter((o) => o.kind === 'focusTrash').length
+  }
 }

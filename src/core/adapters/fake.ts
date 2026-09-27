@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type {
+  DidaFocus,
   DidaGroup,
   DidaPreference,
   DidaProject,
@@ -10,7 +11,7 @@ import type {
   NotionPropertyValue,
   NotionQueryResult
 } from '../types'
-import type { DidaReader } from './dida'
+import type { DidaReader, FocusKind } from './dida'
 import type { NotionClient } from './notion'
 import { CliError } from './exec'
 
@@ -20,6 +21,7 @@ export class FakeDida implements DidaReader {
   projects: DidaProject[] = []
   groups: DidaGroup[] = []
   tasks = new Map<string, DidaTask>()
+  focus = new Map<string, DidaFocus>()
   preference: DidaPreference = { timeZone: 'Asia/Shanghai' }
   calls: string[] = []
   failWith: CliError | null = null
@@ -46,6 +48,17 @@ export class FakeDida implements DidaReader {
 
   deleteTask(id: string): void {
     this.tasks.delete(id)
+  }
+
+  addFocus(f: Partial<DidaFocus> & { id: string; startTime: string; endTime: string }): DidaFocus {
+    const rec: DidaFocus = { type: 0, etag: randomUUID().slice(0, 8), ...f }
+    this.focus.set(rec.id, rec)
+    return rec
+  }
+
+  updateFocus(id: string, patch: Partial<DidaFocus>): void {
+    const f = this.focus.get(id)
+    if (f) this.focus.set(id, { ...f, ...patch, etag: randomUUID().slice(0, 8) })
   }
 
   async getPreference(): Promise<DidaPreference> {
@@ -82,6 +95,25 @@ export class FakeDida implements DidaReader {
     const t = this.tasks.get(taskId)
     return t && t.projectId === projectId ? structuredClone(t) : null
   }
+  async listFocus(from: Date, to: Date, type: FocusKind): Promise<DidaFocus[]> {
+    this.check(`focus:${type}`)
+    if (to.getTime() - from.getTime() > 30 * 86_400_000) throw new CliError('DIDA API 错误 400: range > 30 days', 'dida', 'validation', 400)
+    const want = type === 'pomodoro' ? 0 : 1
+    return [...this.focus.values()]
+      .filter((f) => Number(f.type ?? 0) === want)
+      .filter((f) => {
+        const at = Date.parse(f.startTime!.replace(/([+-]\d{2})(\d{2})$/, '$1:$2'))
+        return at >= from.getTime() && at <= to.getTime()
+      })
+      .map((f) => structuredClone(f))
+  }
+
+  async getFocus(focusId: string): Promise<DidaFocus | null> {
+    this.check('focus:get')
+    const f = this.focus.get(focusId)
+    return f ? structuredClone(f) : null
+  }
+
   async listInboxTasks(): Promise<DidaTask[] | null> {
     this.check('inbox')
     return [...this.tasks.values()].filter((t) => t.projectId.startsWith('inbox') && (t.status ?? 0) === 0)
@@ -151,6 +183,7 @@ export class FakeNotion implements NotionClient {
         v.select = opt ? { id: opt.id, name: opt.name } : null
       } else if (schema.type === 'date') v.date = value.date ? { start: value.date.start, end: value.date.end ?? null } : null
       else if (schema.type === 'relation') v.relation = (value.relation ?? []).map((r: any) => ({ id: r.id }))
+      else if (schema.type === 'number') v.number = value.number ?? null
       page.properties[name] = v
     }
   }
@@ -235,6 +268,10 @@ export class FakeNotion implements NotionClient {
     const found = this.propName(ds, filter.property)
     if (!found) return false
     const value = page.properties[found.name]
+    if (filter.relation) {
+      const ids = (value?.relation ?? []).map((r) => r.id)
+      if ('contains' in filter.relation) return ids.includes(filter.relation.contains)
+    }
     if (filter.rich_text) {
       const text = (value?.rich_text ?? []).map((t) => t.plain_text).join('')
       if (filter.rich_text.is_not_empty) return text.length > 0
@@ -289,6 +326,7 @@ export class FakeNotion implements NotionClient {
 
 export const FLOW_IDS = {
   tasks: 'ds-tasks-0000-0000-0000-000000000001',
+  focus: 'ds-focus-0000-0000-0000-000000000004',
   domains: 'ds-domains-000-0000-0000-000000000002',
   areas: 'ds-areas-0000-0000-0000-000000000003',
   status: { collect: 'st-collect', shelve: 'st-shelve', todo: 'st-todo', doing: 'st-doing', done: 'st-done', abandoned: 'st-abandoned' },
@@ -329,7 +367,8 @@ export function createFlowWorkspace(notion: FakeNotion, opts: { withDidaId?: boo
     完成日期: { id: 'p_done', name: '完成日期', type: 'date' },
     '下一步做什么？': { id: 'p_note', name: '下一步做什么？', type: 'rich_text' },
     二级领域: { id: 'p_domain', name: '二级领域', type: 'relation', relation: { data_source_id: FLOW_IDS.domains } },
-    关联项目: { id: 'p_project', name: '关联项目', type: 'relation', relation: { data_source_id: 'ds-projects' } }
+    关联项目: { id: 'p_project', name: '关联项目', type: 'relation', relation: { data_source_id: 'ds-projects' } },
+    关联番茄: { id: 'p_pomo', name: '关联番茄', type: 'relation', relation: { data_source_id: FLOW_IDS.focus } }
   }
   if (opts.withDidaId) taskProps['滴答ID'] = { id: 'p_滴答ID', name: '滴答ID', type: 'rich_text' }
   notion.addDataSource({ id: FLOW_IDS.tasks, title: [{ plain_text: 'FLO.W - 我的任务 DB · Max' }], properties: taskProps })
@@ -339,6 +378,18 @@ export function createFlowWorkspace(notion: FakeNotion, opts: { withDidaId?: boo
     properties: {
       二级领域: { id: 'title', name: '二级领域', type: 'title' },
       'FLOW - 一级领域': { id: 'p_area', name: 'FLOW - 一级领域', type: 'relation', relation: { data_source_id: FLOW_IDS.areas } }
+    }
+  })
+  notion.addDataSource({
+    id: FLOW_IDS.focus,
+    title: [{ plain_text: '任务番茄数据库' }],
+    properties: {
+      名称: { id: 'title', name: '名称', type: 'title' },
+      关联任务: { id: 'f_task', name: '关联任务', type: 'relation', relation: { data_source_id: FLOW_IDS.tasks } },
+      开始时间: { id: 'f_start', name: '开始时间', type: 'date' },
+      结束时间: { id: 'f_end', name: '结束时间', type: 'date' },
+      番茄默认时长: { id: 'f_minutes', name: '番茄默认时长', type: 'number' },
+      番茄提醒: { id: 'f_remind', name: '番茄提醒', type: 'date' }
     }
   })
   notion.addDataSource({
